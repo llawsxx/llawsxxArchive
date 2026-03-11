@@ -1,10 +1,10 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
 /*
- * lxar - LLawsXX ARchive format - Windows版本 (支持AES加密)
+ * lxar - LLawsXX ARchive format - Windows版本 (支持AES加密和ZSTD压缩)
  *
  *
  * 使用方法:
- *   lxar archive [-o <输出文件>] [-s <size>] [-p <password>] <目录>        - 创建归档
+ *   lxar archive [-o <输出文件>] [-s <size>] [-p <password>] [-z <level>] <目录>        - 创建归档
  *   lxar extract [-o <输出目录>] [-p <password>] <归档文件>                 - 提取所有文件
  *   lxar extract [-o <输出目录>] [-p <password>] <归档> <文件列表>          - 提取指定文件
  *   lxar list <归档>                        - 列出归档内容
@@ -21,8 +21,10 @@
 #include "aes.h"
 #include <windows.h>
 #include <direct.h>
+#include <zstd.h>  // 添加ZSTD头文件
+#include <errno.h>
 
-#define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认512KB
+#define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
 #define MIN_SECTION_SIZE (1024)            // 最小1KB
 #define MAX_SECTION_SIZE (64 * 1024 * 1024) // 最大64MB
 
@@ -30,8 +32,13 @@
 #define MAGIC_NUMBER_DIR 0x44495200   // "DIR\0" in ASCII
 #define MAX_PATH_LEN 256
 #define CRC32_SIZE 4
+
  // 标志位定义
 #define FLAG_ENCRYPTED 0x01  // 数据已加密
+#define FLAG_COMPRESSED 0x02  // 数据已压缩 (ZSTD)
+
+// 默认压缩级别
+#define DEFAULT_COMPRESSION_LEVEL 3
 
 #pragma pack(push, 1)
 typedef struct {
@@ -40,10 +47,11 @@ typedef struct {
     uint64_t mtime;           // 8B Modification time (UNIX timestamp)
     uint64_t total_size;      // 8B Total file size (0 for directories)
     uint64_t section_id;      // 8B Section ID (starts from 0)
-    uint32_t section_size;    // 4B Section size (0 for directories)
+    uint32_t section_size;    // 4B Section size (压缩后的数据大小，0 for directories)
+    uint32_t original_size;   // 4B 原始数据大小 (压缩前，用于解压缩)
     uint64_t total_section_count;   // 8B total section count (0 for directories)
     uint64_t data_offset;     // 8B 数据在原文件中的偏移量
-    uint32_t flags;           // 4B 标志位 (如: 0x01 = 加密)
+    uint32_t flags;           // 4B 标志位 (如: 0x01 = 加密, 0x02 = 压缩)
     uint32_t header_crc32;    // 4B header CRC32
     // Data follows immediately for files
     // Finally 4B CRC32 for files
@@ -60,8 +68,8 @@ typedef struct {
     uint64_t first_block_offset;
     int is_directory;          // 是否为目录
     int is_encrypted;          // 是否加密
+    int is_compressed;         // 是否压缩
 } FileInfo;
-
 
 // 进度显示上下文结构体
 typedef struct {
@@ -74,6 +82,8 @@ typedef struct {
     uint64_t last_bytes;         // 上次打印时的字节数
     DWORD last_speed_time;       // 上次计算速度的时间
     uint64_t last_speed_bytes;   // 上次计算速度时的字节数
+    uint64_t original_total;     // 原始总数据量（未压缩前）
+    uint64_t compressed_total;   // 压缩后总数据量
     int initialized;             // 是否已初始化
     int printed;
 } ProgressContext;
@@ -85,13 +95,13 @@ FILE* g_archive = NULL;
 uint32_t g_section_size = DEFAULT_SECTION_SIZE;  // 全局section size
 uint8_t g_encryption_key[16] = { 0 };  // AES-128密钥
 int g_encryption_enabled = 0;        // 是否启用加密
+int g_compression_enabled = 1;        // 是否启用压缩（默认开启）
+int g_compression_level = DEFAULT_COMPRESSION_LEVEL;  // 压缩级别
 char g_output_path[MAX_PATH] = { 0 }; // 输出路径
 // 添加全局变量来保存输入根路径
 const char* g_input_root_path = NULL;
 int g_error_count = 0;           // 错误计数
 int g_warning_count = 0;         // 警告计数
-
-
 
 // 初始化进度显示上下文
 void progress_init(ProgressContext* ctx, uint64_t total, uint64_t total_sections, const char* filename) {
@@ -104,12 +114,20 @@ void progress_init(ProgressContext* ctx, uint64_t total, uint64_t total_sections
     ctx->last_bytes = 0;
     ctx->last_speed_time = 0;
     ctx->last_speed_bytes = 0;
+    ctx->original_total = 0;
+    ctx->compressed_total = 0;
     ctx->initialized = 1;
     ctx->printed = 0;
 }
 
+void progress_update_compression(ProgressContext* ctx, uint64_t original_bytes, uint64_t compressed_bytes) {
+    if (!ctx->initialized) return;
+    ctx->original_total += original_bytes;
+    ctx->compressed_total += compressed_bytes;
+}
+
 // 更新进度并决定是否打印
-int progress_update(ProgressContext* ctx, uint64_t bytes_processed, uint64_t section_num,int force_print) {
+int progress_update(ProgressContext* ctx, uint64_t bytes_processed, uint64_t section_num, int force_print) {
     if (!ctx->initialized) return 0;
     ctx->current = bytes_processed;
     ctx->current_section = section_num;
@@ -131,19 +149,41 @@ int progress_update(ProgressContext* ctx, uint64_t bytes_processed, uint64_t sec
             }
         }
 
+        // 计算压缩率
+        double compression_ratio = 0.0;
+        if (ctx->original_total > 0) {
+            compression_ratio = ((double)ctx->compressed_total / ctx->original_total) * 100.0;
+        }
+
         // 打印进度信息
         if (ctx->total > 0) {
-            printf("\rProgress: %llu MB / %llu MB (%d%%) | Speed: %.2f KB/s | Section id: %llu/%llu   ",
-                ctx->current / (1024 * 1024),
-                ctx->total / (1024 * 1024),
-                percent,
-                speed,
-                (unsigned long long)ctx->current_section,
-                (unsigned long long)ctx->total_sections);
+            if (ctx->original_total > 0) {
+                // 显示压缩率
+                printf("\rProgress: %llu MB / %llu MB (%d%%) | Speed: %.2f KB/s | Section id: %llu/%llu | Compression: %.1f%% (%llu -> %llu)   ",
+                    ctx->current / (1024 * 1024),
+                    ctx->total / (1024 * 1024),
+                    percent,
+                    speed,
+                    (unsigned long long)ctx->current_section,
+                    (unsigned long long)ctx->total_sections,
+                    compression_ratio,
+                    (unsigned long long)ctx->original_total,
+                    (unsigned long long)ctx->compressed_total);
+            }
+            else {
+                // 没有压缩率数据
+                printf("\rProgress: %llu MB / %llu MB (%d%%) | Speed: %.2f KB/s | Section id: %llu/%llu   ",
+                    ctx->current / (1024 * 1024),
+                    ctx->total / (1024 * 1024),
+                    percent,
+                    speed,
+                    (unsigned long long)ctx->current_section,
+                    (unsigned long long)ctx->total_sections);
+            }
         }
         else {
             // 对于总大小为0的文件（空文件），只显示section进度
-            printf("\rProgress: Section id: %llu/%llu | Speed: %.2f KB/s   ",
+            printf("\rProgress: Section: %llu/%llu | Speed: %.2f KB/s   ",
                 (unsigned long long)ctx->current_section,
                 (unsigned long long)ctx->total_sections,
                 speed);
@@ -162,26 +202,32 @@ int progress_update(ProgressContext* ctx, uint64_t bytes_processed, uint64_t sec
 // 进度显示结束，打印换行
 void progress_finish(ProgressContext* ctx) {
     if (ctx->printed) {
-        progress_update(ctx, ctx->total, ctx->total_sections - 1,1);
+        progress_update(ctx, ctx->total, ctx->total_sections - 1, 1);
         printf("\n");
+        // 显示最终压缩率
+        if (ctx->original_total > 0 && ctx->compressed_total > 0) {
+            double compression_ratio = ((double)ctx->compressed_total / ctx->original_total) * 100.0;
+            double saved_space = 100.0 - compression_ratio;
+            printf("  Final compression: %.1f%% of original (%.1f%% space saved) - %llu -> %llu bytes\n",
+                compression_ratio, saved_space,
+                (unsigned long long)ctx->original_total,
+                (unsigned long long)ctx->compressed_total);
+        }
     }
     ctx->initialized = 0;
 }
 
-
 // 大小端转换函数
 uint16_t htobe16(uint16_t x) {
 #if defined(_MSC_VER) && (_MSC_VER >= 1900) || defined(__MINGW32__)
-    // Windows下使用_byteswap_ushort
     return _byteswap_ushort(x);
 #else
-    // 通用实现
     return (x >> 8) | (x << 8);
 #endif
 }
 
 uint16_t be16toh(uint16_t x) {
-    return htobe16(x); // 对称操作
+    return htobe16(x);
 }
 
 uint32_t htobe32(uint32_t x) {
@@ -218,11 +264,10 @@ uint64_t be64toh(uint64_t x) {
     return htobe64(x);
 }
 
-
 // 将主机字节序的BlockHeader转换为大端字节序（用于写入）
 void header_host_to_be(const BlockHeader* host, BlockHeader* be) {
     be->magic = htobe32(host->magic);
-    memcpy(be->filename, host->filename, 256); // 字符串不需要转换
+    memcpy(be->filename, host->filename, 256);
     be->mtime = htobe64(host->mtime);
     be->total_size = htobe64(host->total_size);
     be->section_id = htobe64(host->section_id);
@@ -231,20 +276,22 @@ void header_host_to_be(const BlockHeader* host, BlockHeader* be) {
     be->data_offset = htobe64(host->data_offset);
     be->flags = htobe32(host->flags);
     be->header_crc32 = htobe32(host->header_crc32);
+    be->original_size = htobe32(host->original_size);
 }
 
 // 将大端字节序的BlockHeader转换为主机字节序（用于读取）
 void header_be_to_host(const BlockHeader* be, BlockHeader* host) {
     host->magic = be32toh(be->magic);
-    memcpy(host->filename, be->filename, 256); // 字符串不需要转换
+    memcpy(host->filename, be->filename, 256);
     host->mtime = be64toh(be->mtime);
     host->total_size = be64toh(be->total_size);
     host->section_id = be64toh(be->section_id);
     host->section_size = be32toh(be->section_size);
     host->total_section_count = be64toh(be->total_section_count);
-    host->data_offset = be64toh(be->data_offset);  // 新增
+    host->data_offset = be64toh(be->data_offset);
     host->flags = be32toh(be->flags);
     host->header_crc32 = be32toh(be->header_crc32);
+    host->original_size = be32toh(be->original_size);
 }
 
 // 写入CRC32（自动转换字节序）
@@ -279,17 +326,16 @@ int read_block_header(FILE* file, BlockHeader* header) {
     size_t read = fread(&be_header, sizeof(BlockHeader), 1, file);
     if (read != 1) return 0;
     // 计算header CRC时不包括header_crc32字段
-    uint32_t calc_header_crc32 = crc32_calc(&be_header, sizeof(BlockHeader) - 4); // 减去header_crc32
+    uint32_t calc_header_crc32 = crc32_calc(&be_header, sizeof(BlockHeader) - 4);
     uint32_t crc = be32toh(be_header.header_crc32);
     if (crc != calc_header_crc32) {
-        printf("Error: Header crc32 mismatch (stored header crc32: 0x%08x calc header crc32: 0x%08x)\n",
+        printf("Error: Header crc32 mismatch (stored: 0x%08x calc: 0x%08x)\n",
             crc, calc_header_crc32);
         return 0;
     }
     header_be_to_host(&be_header, header);
     return 1;
 }
-
 
 // 将16进制字符串转换为字节数组
 int hex_to_bytes(const char* hex, uint8_t* bytes, size_t max_bytes) {
@@ -327,21 +373,19 @@ void generate_key_from_password(const char* password) {
     }
     else {
         // 否则使用密码的MD5或简单哈希作为密钥
-        // 这里简化处理：直接复制密码，不足补0，超过截断
         size_t len = strlen(password);
         if (len > 16) len = 16;
         memcpy(g_encryption_key, password, len);
         if (len < 16) {
             memset(g_encryption_key + len, 0, 16 - len);
         }
-        printf("Password is regular string, converted to 16-byte key (truncated/padded with zeros)\n");
+        printf("Password is regular string, converted to 16-byte key\n");
     }
 
     // 打印生成的16字节密钥
     printf("Generated AES-128 key (16 bytes): ");
     for (int i = 0; i < 16; i++) {
-        printf("%02x", g_encryption_key[i]);
-        if (i < 15) printf(" ");
+        printf("%02x ", g_encryption_key[i]);
     }
     printf("\n");
 
@@ -368,18 +412,18 @@ uint32_t get_pad_len(uint32_t data_len) {
 
 int pkcs7_unpad(uint8_t* data, uint32_t padded_len, uint32_t* original_len) {
     if (padded_len == 0 || padded_len % AES_BLOCK_SIZE != 0) {
-        return -1;  // 无效的填充长度
+        return -1;
     }
 
     uint8_t padding_value = data[padded_len - 1];
     if (padding_value == 0 || padding_value > AES_BLOCK_SIZE) {
-        return -1;  // 无效的填充值
+        return -1;
     }
 
     // 验证所有填充字节
     for (uint32_t i = padded_len - padding_value; i < padded_len; i++) {
         if (data[i] != padding_value) {
-            return -1;  // 填充不一致
+            return -1;
         }
     }
 
@@ -409,6 +453,53 @@ void process_data_block(uint8_t* data, uint32_t data_len, uint32_t header_crc, i
     else {
         aes_decrypt_cbc_inplace(data, data_len, key_schedule, AES_KEY_SIZE, iv);
     }
+}
+
+// ZSTD压缩函数
+uint8_t* compress_zstd(const uint8_t* data, size_t data_len, size_t* compressed_len, int level) {
+    // 获取最大压缩后大小
+    size_t max_compressed_size = ZSTD_compressBound(data_len);
+    uint8_t* compressed = (uint8_t*)malloc(max_compressed_size);
+    if (!compressed) {
+        printf("Error: Failed to allocate compression buffer\n");
+        return NULL;
+    }
+
+    // 执行压缩
+    *compressed_len = ZSTD_compress(compressed, max_compressed_size, data, data_len, level);
+
+    if (ZSTD_isError(*compressed_len)) {
+        printf("Error: ZSTD compression failed: %s\n", ZSTD_getErrorName(*compressed_len));
+        free(compressed);
+        return NULL;
+    }
+
+    return compressed;
+}
+
+// ZSTD解压缩函数
+uint8_t* decompress_zstd(const uint8_t* compressed_data, size_t compressed_len, size_t original_len) {
+    uint8_t* decompressed = (uint8_t*)malloc(original_len);
+    if (!decompressed) {
+        printf("Error: Failed to allocate decompression buffer\n");
+        return NULL;
+    }
+
+    size_t result = ZSTD_decompress(decompressed, original_len, compressed_data, compressed_len);
+
+    if (ZSTD_isError(result)) {
+        printf("Error: ZSTD decompression failed: %s\n", ZSTD_getErrorName(result));
+        free(decompressed);
+        return NULL;
+    }
+
+    if (result != original_len) {
+        printf("Error: Decompressed size mismatch: expected %zu, got %zu\n", original_len, result);
+        free(decompressed);
+        return NULL;
+    }
+
+    return decompressed;
 }
 
 char* dirname(char* path) {
@@ -480,7 +571,6 @@ int get_relative_path(const char* full_path, const char* root_path, char* relati
     // 检查full_path是否以root_path开头
     if (_strnicmp(norm_full, norm_root, root_len) != 0) {
         // 对于SMB路径或其他网络路径的特殊处理
-        // 如果根路径包含盘符（如 D:），则去掉盘符再比较
         char* root_colon = strchr(norm_root, ':');
         char* full_colon = strchr(norm_full, ':');
 
@@ -504,7 +594,6 @@ int get_relative_path(const char* full_path, const char* root_path, char* relati
         if (full_colon) {
             strncpy(relative_path, full_colon + 1, max_len - 1);
             relative_path[max_len - 1] = '\0';
-            // 移除开头的斜杠
             while (*relative_path == '\\' || *relative_path == '/') {
                 memmove(relative_path, relative_path + 1, strlen(relative_path));
             }
@@ -588,6 +677,28 @@ uint32_t parse_size(const char* size_str) {
     }
 
     return (uint32_t)size;
+}
+
+// 解析压缩级别参数
+int parse_compression_level(const char* level_str) {
+    char* endptr;
+    long level = strtol(level_str, &endptr, 10);
+
+    if (endptr == level_str || *endptr != '\0') {
+        printf("Warning: Invalid compression level '%s', using default %d\n",
+            level_str, DEFAULT_COMPRESSION_LEVEL);
+        return DEFAULT_COMPRESSION_LEVEL;
+    }
+    if (level == 0) return level;
+
+    // ZSTD压缩级别范围通常是1-22
+    if (level < 1 || level > 22) {
+        printf("Warning: Compression level %ld out of range (1-22), using default %d\n",
+            level, DEFAULT_COMPRESSION_LEVEL);
+        return DEFAULT_COMPRESSION_LEVEL;
+    }
+
+    return (int)level;
 }
 
 // 将Unix时间戳转换为可读的日期时间字符串
@@ -741,7 +852,7 @@ int validate_block_header(BlockHeader* header, long long found_pos, long long st
     }
 
     if (start_pos != found_pos) {
-        printf("Block %llu: Start position not equal to found position (start position: 0x%llx found position: 0x%llx)\n",
+        printf("Block %llu: Start position not equal to found position (start: 0x%llx found: 0x%llx)\n",
             (unsigned long long)(block_num ? *block_num : 0),
             (unsigned long long)start_pos, (unsigned long long)found_pos);
     }
@@ -758,7 +869,7 @@ int validate_block_header(BlockHeader* header, long long found_pos, long long st
 
     if (block_num) (*block_num)++;
 
-    return 0; // 验证通过
+    return 0;
 }
 
 // 扫描并定位下一个magic number
@@ -767,22 +878,16 @@ long long find_next_magic(FILE* archive, long long start_pos, long long file_siz
     long long pos = start_pos;
     uint32_t magic_accumulator = 0;
 
-    // 获取文件大小
     if (start_pos >= file_size - 4) {
         return -1;
     }
 
-    // 定位到起始位置
     _fseeki64(archive, pos, SEEK_SET);
 
-    // 逐字节扫描
     while (fread(&byte, 1, 1, archive) == 1) {
-        // 将新字节移入累加器
         magic_accumulator = ((magic_accumulator << 8) & 0xFFFFFF00) | byte;
 
-        // 检查累加器是否等于magic number (可以是FILE或DIR)
         if (magic_accumulator == MAGIC_NUMBER_FILE || magic_accumulator == MAGIC_NUMBER_DIR) {
-            // 找到magic number，返回起始位置（当前pos - 3）
             long long found_pos = pos - 3;
             _fseeki64(archive, found_pos, SEEK_SET);
             return found_pos;
@@ -826,7 +931,7 @@ void process_directory(const char* dirpath) {
     printf("Archiving directory: %s\n", relative_path);
 
     // 创建目录块
-    BlockHeader header;
+    BlockHeader header = { 0 };
     header.magic = MAGIC_NUMBER_DIR;
     strncpy(header.filename, relative_path, 255);
     header.filename[255] = '\0';
@@ -836,7 +941,8 @@ void process_directory(const char* dirpath) {
     header.section_size = 0;
     header.total_section_count = 0;
     header.data_offset = 0;
-    header.flags = g_encryption_enabled ? FLAG_ENCRYPTED : 0;
+    header.flags = 0;
+    header.original_size = 0;
 
     // 使用封装函数写入（自动转换字节序）
     if (write_block_header(g_archive, &header) != 1) {
@@ -888,7 +994,7 @@ void process_file(const char* filepath) {
         // 处理0字节文件
         printf("Archiving empty file: %s\n", relative_path);
 
-        BlockHeader header;
+        BlockHeader header = { 0 };
         header.magic = MAGIC_NUMBER_FILE;
         strncpy(header.filename, relative_path, 255);
         header.filename[255] = '\0';
@@ -897,8 +1003,11 @@ void process_file(const char* filepath) {
         header.section_id = 0;
         header.section_size = 0;
         header.total_section_count = 0;
-        header.flags = g_encryption_enabled ? FLAG_ENCRYPTED : 0;
+        header.flags = 0;
+        if (g_encryption_enabled) header.flags |= FLAG_ENCRYPTED;
+        if (g_compression_enabled) header.flags |= FLAG_COMPRESSED;
         header.data_offset = 0;
+        header.original_size = 0;
 
         // 使用封装函数写入（自动转换字节序）
         if (write_block_header(g_archive, &header) != 1) {
@@ -930,95 +1039,155 @@ void process_file(const char* filepath) {
         ProgressContext progress;
         progress_init(&progress, file_size, total_section_count, relative_path);
 
-        printf("Archiving: %s (size: %llu bytes, sections: %llu, section size: %u bytes%s)\n",
+        printf("Archiving: %s (size: %llu bytes, sections: %llu, section size: %u bytes%s%s)\n",
             relative_path, (unsigned long long)file_size,
             (unsigned long long)total_section_count, g_section_size,
-            g_encryption_enabled ? ", encrypted" : "");
+            g_encryption_enabled ? ", encrypted" : "",
+            g_compression_enabled ? ", compressed (ZSTD)" : "");
 
         while (remaining > 0)
         {
             uint32_t section_size = (remaining > g_section_size) ? g_section_size : (uint32_t)remaining;
-            uint32_t pad_len = g_encryption_enabled ? get_pad_len(section_size) : 0;
 
-            BlockHeader header;
-            header.magic = MAGIC_NUMBER_FILE;
-            strncpy(header.filename, relative_path, 255);
-            header.filename[255] = '\0';
-            header.mtime = st.st_mtime;
-            header.total_size = file_size;
-            header.section_id = section_id;
-            header.section_size = section_size + pad_len;
-            header.total_section_count = total_section_count;
-            header.flags = g_encryption_enabled ? FLAG_ENCRYPTED : 0;
-            header.data_offset = file_offset;
-
-            // 写入块头
-            if (write_block_header(g_archive, &header) != 1) {
-                printf("Error: Failed to write file header for %s section id %llu\n",
-                    relative_path, (unsigned long long)section_id);
-                fclose(infile);
-                g_error_count++;
-                return;
-            }
-
-            // 计算CRC32
-            CRC32_Context ctx;
-            crc32_init(&ctx);
-
-            // 读取数据
-            uint32_t data_len = section_size;
-            uint32_t padded_data_len = data_len + pad_len;
-            uint8_t* buffer = (uint8_t*)malloc(padded_data_len);
-            if (!buffer) {
+            // 读取原始数据
+            uint8_t* original_buffer = (uint8_t*)malloc(section_size);
+            if (!original_buffer) {
                 printf("Error: Out of memory for %s\n", relative_path);
                 fclose(infile);
                 g_error_count++;
                 return;
             }
 
-            size_t actual_read = fread(buffer, 1, data_len, infile);
-            if (data_len - actual_read > 0) {
+            size_t actual_read = fread(original_buffer, 1, section_size, infile);
+            if (section_size - actual_read > 0) {
                 printf("Error: Short read for %s (expected %u bytes, got %zu)\n",
-                    relative_path, data_len, actual_read);
-                free(buffer);
+                    relative_path, section_size, actual_read);
+                free(original_buffer);
                 fclose(infile);
                 g_error_count++;
                 return;
+            }
+
+            uint8_t* data_to_write = original_buffer;
+            uint32_t data_to_write_len = section_size;
+            uint32_t original_len = section_size;
+            uint32_t compressed_len = 0;
+
+            // 压缩数据（如果启用压缩）
+            if (g_compression_enabled) {
+                size_t zstd_compressed_len;
+                uint8_t* compressed_data = compress_zstd(original_buffer, section_size,
+                    &zstd_compressed_len, g_compression_level);
+
+                if (compressed_data) {
+                    // 只有在压缩后确实变小了才使用压缩数据
+                    if (zstd_compressed_len < section_size) {
+                        data_to_write = compressed_data;
+                        data_to_write_len = (uint32_t)zstd_compressed_len;
+                        compressed_len = (uint32_t)zstd_compressed_len;
+
+                        // 更新压缩率信息
+                        progress_update_compression(&progress, section_size, (uint32_t)zstd_compressed_len);
+
+                        free(original_buffer);  // 释放原始缓冲区
+                    }
+                    else {
+                        // 压缩后没有变小，使用原始数据
+                        free(compressed_data);
+                        // 更新压缩率信息（未压缩，比例为1:1）
+                        progress_update_compression(&progress, section_size, section_size);
+                        //printf("Debug: Section %llu compression ratio not beneficial, using original (zstd_compressed_len %lld section_size %u)\n",
+                        //    (unsigned long long)section_id, zstd_compressed_len, section_size);
+                    }
+                }
+            }
+            else {
+                // 压缩未启用，更新压缩率信息（比例为1:1）
+                progress_update_compression(&progress, section_size, section_size);
             }
 
             // 如果需要加密
+            uint32_t pad_len = 0;
             if (g_encryption_enabled) {
-                pkcs7_pad(buffer, data_len, pad_len);
-                process_data_block(buffer, padded_data_len, header.header_crc32, 1);
+                pad_len = get_pad_len(data_to_write_len);
+                uint8_t* padded_buffer = (uint8_t*)realloc(data_to_write, data_to_write_len + pad_len);
+                if (!padded_buffer) {
+                    printf("Error: Failed to allocate padding buffer\n");
+                    free(data_to_write);
+                    fclose(infile);
+                    g_error_count++;
+                    return;
+                }
+                data_to_write = padded_buffer;
+                pkcs7_pad(data_to_write, data_to_write_len, pad_len);
+                data_to_write_len += pad_len;
             }
 
-            // 更新CRC（CRC是在加密后计算的）
-            crc32_update(&ctx, buffer, padded_data_len);
+            BlockHeader header = { 0 };
+            header.magic = MAGIC_NUMBER_FILE;
+            strncpy(header.filename, relative_path, 255);
+            header.filename[255] = '\0';
+            header.mtime = st.st_mtime;
+            header.total_size = file_size;
+            header.section_id = section_id;
+            header.section_size = data_to_write_len;  // 加密后的数据大小（如果有加密）
+            header.total_section_count = total_section_count;
+            header.flags = 0;
+            if (g_encryption_enabled) header.flags |= FLAG_ENCRYPTED;
+            if (g_compression_enabled && compressed_len > 0) header.flags |= FLAG_COMPRESSED;
+            header.data_offset = file_offset;
+            header.original_size = original_len;  // 保存原始大小用于解压缩
 
-            // 写入数据
-            if (fwrite(buffer, 1, padded_data_len, g_archive) != padded_data_len) {
-                printf("Error: Failed to write data for %s section id %llu\n",
+            // 写入块头
+            if (write_block_header(g_archive, &header) != 1) {
+                printf("Error: Failed to write file header for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
-                free(buffer);
+                free(data_to_write);
                 fclose(infile);
                 g_error_count++;
                 return;
             }
-            free(buffer);
+
+            // 计算CRC32（数据写入前）
+            CRC32_Context ctx;
+            crc32_init(&ctx);
+
+            // 如果需要加密，在这里执行加密（必须在CRC计算之前）
+            if (g_encryption_enabled) {
+                process_data_block(data_to_write, data_to_write_len, header.header_crc32, 1);
+            }
+
+            // 更新CRC（加密后的数据）
+            crc32_update(&ctx, data_to_write, data_to_write_len);
+
+            // 写入数据
+            if (fwrite(data_to_write, 1, data_to_write_len, g_archive) != data_to_write_len) {
+                printf("Error: Failed to write data for %s section id %llu\n",
+                    relative_path, (unsigned long long)section_id);
+                free(data_to_write);
+                fclose(infile);
+                g_error_count++;
+                return;
+            }
 
             uint32_t crc = crc32_final(&ctx);
+
             // 写入CRC32
             if (write_crc32(g_archive, crc) != 1) {
                 printf("Error: Failed to write CRC for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
+                free(data_to_write);
                 fclose(infile);
                 g_error_count++;
                 return;
             }
 
+            // 清理
+            free(data_to_write);
+
             remaining -= section_size;
-            total_write += data_len;
-            file_offset += data_len;
+            total_write += section_size;
+            file_offset += section_size;
 
             progress_update(&progress, total_write, section_id, 0);
 
@@ -1077,6 +1246,9 @@ int create_archive(const char* archive_name, const char* input_path) {
     if (g_encryption_enabled) {
         printf("Encryption: AES-128 CBC enabled\n");
     }
+    if (g_compression_enabled) {
+        printf("Compression: ZSTD level %d enabled\n", g_compression_level);
+    }
 
     // Windows下使用自定义目录遍历，先处理目录，再处理文件
     walk_directory(input_path, process_file, process_directory);
@@ -1130,6 +1302,7 @@ int list_archive(const char* archive_name) {
         uint64_t total_sections;
         uint64_t mtime;
         int is_encrypted;
+        int is_compressed;
     } DisplayedFile;
 
     DisplayedFile* displayed_files = NULL;
@@ -1137,7 +1310,7 @@ int list_archive(const char* archive_name) {
     int displayed_capacity = 0;
 
     printf("Archive contents: %s\n", archive_name);
-    printf("%-30s %-20s %-10s %-10s %-8s %s\n", "Name", "Modified Time", "Type", "Size", "Encrypt", "CRC");
+    printf("%-30s %-20s %-10s %-10s %-12s %s\n", "Name", "Modified Time", "Type", "Size", "Flags", "CRC");
     printf("------------------------------------------------\n");
 
     long long filesize = get_file_size(archive_name);
@@ -1148,7 +1321,7 @@ int list_archive(const char* archive_name) {
 
         if (!read_block_header(archive, &header)) {
             // 头损坏的情况
-            printf("%-30s %-20s %-10s %-10s %-8s %s\n",
+            printf("%-30s %-20s %-10s %-10s %-12s %s\n",
                 "[CORRUPTED BLOCK]", "", "ERROR", "", "", "HEADER CRC FAILED");
             start_pos = pos + 1;
             continue;
@@ -1177,15 +1350,16 @@ int list_archive(const char* archive_name) {
         // 格式化时间
         format_datetime(header.mtime, datetime_str, sizeof(datetime_str));
 
-        // 显示信息
-        const char* type_str = (header.magic == MAGIC_NUMBER_DIR) ? "<DIR>" :
-            (header.total_size == 0 ? "<EMPTY>" : "FILE");
-        const char* encrypt_str = (header.flags & FLAG_ENCRYPTED) ? "AES" : "";
+        // 构建标志字符串
+        char flags_str[16] = "";
+        if (header.flags & FLAG_ENCRYPTED) strcat(flags_str, "AES ");
+        if (header.flags & FLAG_COMPRESSED) strcat(flags_str, "ZSTD");
+        if (strlen(flags_str) == 0) strcpy(flags_str, "-");
 
         if (header.magic == MAGIC_NUMBER_DIR) {
             // 目录 - 总是显示
-            printf("%-30s %-20s %-10s %-10s %-8s 0x%08x\n",
-                header.filename, datetime_str, type_str, "", encrypt_str, stored_crc);
+            printf("%-30s %-20s %-10s %-10s %-12s 0x%08x\n",
+                header.filename, datetime_str, "<DIR>", "", flags_str, stored_crc);
             if (strcmp(current_file, header.filename) != 0) {
                 total_dirs++;
                 strcpy(current_file, header.filename);
@@ -1219,13 +1393,14 @@ int list_archive(const char* archive_name) {
                 displayed_files[displayed_count].total_sections = header.total_section_count;
                 displayed_files[displayed_count].mtime = header.mtime;
                 displayed_files[displayed_count].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
+                displayed_files[displayed_count].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
                 displayed_count++;
 
                 // 显示文件信息（使用第一个找到的块的信息）
-                printf("%-30s %-20s %-10s %-10llu %-8s 0x%08x",
-                    header.filename, datetime_str, type_str,
+                printf("%-30s %-20s %-10s %-10llu %-12s 0x%08x",
+                    header.filename, datetime_str, "FILE",
                     (unsigned long long)header.total_size,
-                    encrypt_str, stored_crc);
+                    flags_str, stored_crc);
 
                 // 如果这不是第一个section，添加注释
                 if (header.section_id != 0) {
@@ -1278,6 +1453,7 @@ int verify_archive(const char* archive_name) {
         int has_section0;
         int is_corrupted;
         int is_encrypted;
+        int is_compressed;
     } FileVerifyInfo;
 
     FileVerifyInfo* file_info = NULL;
@@ -1335,6 +1511,7 @@ int verify_archive(const char* archive_name) {
             file_info[file_idx].has_section0 = (header.section_id == 0);
             file_info[file_idx].is_corrupted = 0;
             file_info[file_idx].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
+            file_info[file_idx].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
         }
         else if (file_idx != -1) {
             // 更新现有文件信息
@@ -1405,16 +1582,20 @@ int verify_archive(const char* archive_name) {
                     printf("Warning: Short read for %s\n", header.filename);
                     memset(data_buffer + actual_read, 0, header.section_size - actual_read);
                 }
+
                 // 计算CRC
                 crc32_update(&ctx, data_buffer, header.section_size);
 
-
                 // 如果需要解密
                 if (g_encryption_enabled && (header.flags & FLAG_ENCRYPTED)) {
+                    uint32_t data_len;
                     if (header.section_size % AES_BLOCK_SIZE != 0) {
                         printf("Warning: Section size is not a multiple of AES_BLOCK_SIZE\n");
                     }
-                    process_data_block(data_buffer, header.section_size, header.header_crc32, 0);  // 0 = decrypt
+                    process_data_block(data_buffer, header.section_size, header.header_crc32, 0);
+                    if (pkcs7_unpad(data_buffer, header.section_size, &data_len) < 0) {
+                        printf("Error: PKCS#7 unpad failed\n");
+                    }
                 }
 
                 uint32_t crc = crc32_final(&ctx);
@@ -1435,15 +1616,23 @@ int verify_archive(const char* archive_name) {
                     status = "OK";
                 }
 
+                // 构建标志字符串
+                char flags_str[32] = "";
+                if (header.flags & FLAG_ENCRYPTED) strcat(flags_str, "encrypted ");
+                if (header.flags & FLAG_COMPRESSED) strcat(flags_str, "compressed");
+
                 // 显示section信息
-                printf("%-30s %-20s %-10s %s (Section id %llu/%llu, Data Offset %llu, CRC: 0x%08x%s)\n",
+                printf("%-30s %-20s %-10s %s (Section id %llu/%llu, Data Offset %llu, Original Size: %u,Section Size: %u, CRC: 0x%08x%s%s)\n",
                     header.filename, datetime_str, "FILE",
                     status,
                     (unsigned long long)header.section_id,
                     (unsigned long long)header.total_section_count,
                     (unsigned long long)header.data_offset,
+                    header.original_size,
+                    header.section_size,
                     stored_crc,
-                    (header.flags & FLAG_ENCRYPTED) ? ", encrypted" : "");
+                    (header.flags & FLAG_ENCRYPTED) ? ", encrypted" : "",
+                    (header.flags & FLAG_COMPRESSED) ? ", compressed" : "");
             }
         }
 
@@ -1483,10 +1672,25 @@ int verify_archive(const char* archive_name) {
             }
 
             if (file_issues == 0 && !file_info[i].is_corrupted) {
-                printf("OK: %s - All %llu sections present and intact%s\n",
-                    file_info[i].filename,
-                    (unsigned long long)file_info[i].total_sections,
-                    file_info[i].is_encrypted ? " (encrypted)" : "");
+                char flags_str[32] = "";
+                if (file_info[i].is_encrypted) strcat(flags_str, "encrypted");
+                if (file_info[i].is_compressed) { 
+                    if (file_info[i].is_encrypted) {
+                        strcat(flags_str, " ");
+                    }
+                    strcat(flags_str, "compressed"); 
+                }
+                if (strlen(flags_str) > 0) {
+                    printf("OK: %s - All %llu sections present and intact (%s)\n",
+                        file_info[i].filename,
+                        (unsigned long long)file_info[i].total_sections,
+                        flags_str);
+                }
+                else {
+                    printf("OK: %s - All %llu sections present and intact\n",
+                        file_info[i].filename,
+                        (unsigned long long)file_info[i].total_sections);
+                }
             }
         }
     }
@@ -1581,6 +1785,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             file_info[found].first_block_offset = _ftelli64(archive) - sizeof(BlockHeader);
             file_info[found].is_directory = (header.magic == MAGIC_NUMBER_DIR);
             file_info[found].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
+            file_info[found].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
         }
         file_info[found].actual_section_count++;
 
@@ -1653,8 +1858,9 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
         if (!should_extract) continue;
 
-        printf("Extracting: %s%s\n", file_info[i].filename,
-            file_info[i].is_encrypted ? " (encrypted)" : "");
+        printf("Extracting: %s%s%s\n", file_info[i].filename,
+            file_info[i].is_encrypted ? " (encrypted)" : "",
+            file_info[i].is_compressed ? " (compressed)" : "");
 
         // 构建输出文件路径
         char output_file_path[MAX_PATH];
@@ -1723,15 +1929,17 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 }
             }
 
-            uint32_t original_len = header.section_size;
+            uint32_t original_len = header.original_size;
+            uint32_t data_len = header.section_size;
+
             // 处理数据（如果有）
-            if (header.section_size > 0) {
+            if (data_len > 0) {
                 // 计算CRC
                 CRC32_Context ctx;
                 crc32_init(&ctx);
 
                 // 读取数据
-                uint8_t* data_buffer = (uint8_t*)malloc(header.section_size);
+                uint8_t* data_buffer = (uint8_t*)malloc(data_len);
                 if (!data_buffer) {
                     printf("Error: Out of memory\n");
                     fclose(outfile);
@@ -1740,34 +1948,74 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                     return -1;
                 }
 
-                size_t actual_read = fread(data_buffer, 1, header.section_size, archive);
-                if (header.section_size - actual_read > 0) {
+                size_t actual_read = fread(data_buffer, 1, data_len, archive);
+                if (data_len - actual_read > 0) {
                     printf("Warning: Short read for %s\n", file_info[i].filename);
-                    memset(data_buffer + actual_read, 0, header.section_size - actual_read);
+                    memset(data_buffer + actual_read, 0, data_len - actual_read);
                 }
-                long long block_start = _ftelli64(archive) - header.section_size;
+                long long block_start = _ftelli64(archive) - actual_read;
 
                 // 更新CRC
-                crc32_update(&ctx, data_buffer, header.section_size);
+                crc32_update(&ctx, data_buffer, data_len);
 
                 // 如果需要解密
                 if (g_encryption_enabled && (header.flags & FLAG_ENCRYPTED)) {
-                    if (header.section_size % AES_BLOCK_SIZE != 0) {
+                    if (data_len % AES_BLOCK_SIZE != 0) {
                         printf("Warning: Section size is not a multiple of AES_BLOCK_SIZE\n");
                     }
-                    process_data_block(data_buffer, header.section_size, header.header_crc32, 0);  // 0 = decrypt
-                    if (pkcs7_unpad(data_buffer, header.section_size, &original_len) < 0) {
+                    process_data_block(data_buffer, data_len, header.header_crc32, 0);
+                    if (pkcs7_unpad(data_buffer, data_len, &data_len) < 0) {
                         printf("Error: PKCS#7 unpad failed\n");
+                        file_corrupted = 1;
+                    }
+                }
+
+                // 如果需要解压缩
+                uint8_t* final_data = data_buffer;
+                uint32_t final_len = data_len;
+
+                if (header.flags & FLAG_COMPRESSED) {
+                    uint8_t* decompressed = decompress_zstd(data_buffer, data_len, original_len);
+                    if (decompressed) {
+                        final_data = decompressed;
+                        final_len = original_len;
+                        free(data_buffer);  // 释放压缩数据
+                    }
+                    else {
+                        printf("Error: Decompression failed for %s section id %llu\n",
+                            file_info[i].filename, (unsigned long long)header.section_id);
+                        file_corrupted = 1;
                     }
                 }
 
                 // 写入文件
-                if (fwrite(data_buffer, 1, original_len, outfile) != original_len) {
-                    printf("Error: Failed to write data for %s section id %llu\n",
-                        file_info[i].filename, (unsigned long long)header.section_id);
+                if (final_len != original_len) {
                     file_corrupted = 1;
+                    printf("Warning: File '%s' section id %llu size mismatch: expected 0x%llx, found 0x%llx\n",
+                        file_info[i].filename, (unsigned long long)header.section_id,
+                        (unsigned long long)header.original_size, (unsigned long long)final_len);
+                    size_t write_len = final_len > original_len ? original_len : final_len;
+                    size_t actual_write = fwrite(final_data, 1, write_len, outfile);
+                    int64_t size_diff = (int64_t)original_len - (int64_t)write_len;
+                    if (actual_write != write_len) {
+                        printf("Error: Failed to write data for %s section id %llu\n",
+                         file_info[i].filename, (unsigned long long)header.section_id);
+                    }
+                    if (size_diff > 0) {
+                        printf("Seeking pass the end of file %llu bytes...\n", original_len - write_len);
+                        if (_fseeki64(outfile, original_len - write_len, SEEK_CUR) != 0) {
+                            printf("Seek failed, error code: %d\n", errno);
+                        }
+                    }
                 }
-                free(data_buffer);
+                else {
+                    if (fwrite(final_data, 1, final_len, outfile) != final_len) {
+                        printf("Error: Failed to write data for %s section id %llu\n",
+                            file_info[i].filename, (unsigned long long)header.section_id);
+                    }
+                }
+
+                free(final_data);
 
                 // 读取存储的CRC
                 uint32_t stored_crc;
@@ -1781,7 +2029,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                     printf("       Calculated: 0x%08x, Stored: 0x%08x\n", crc, stored_crc);
                     printf("       Corruption location: 0x%llx - 0x%llx\n",
                         (unsigned long long)block_start,
-                        (unsigned long long)(block_start + header.section_size));
+                        (unsigned long long)(block_start + data_len));
                     file_corrupted = 1;
                 }
 
@@ -1815,7 +2063,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 }
             }
 
-            progress_update(&progress, write_pos, header.section_id,0);
+            progress_update(&progress, write_pos, header.section_id, 0);
 
             start_pos = _ftelli64(archive);
         }
@@ -1837,9 +2085,23 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 printf("Successfully extracted empty file: %s\n", output_file_path);
             }
             else {
-                printf("Successfully extracted: %s (%llu bytes)%s\n",
-                    output_file_path, (unsigned long long)write_pos,
-                    file_info[i].is_encrypted ? " (decrypted)" : "");
+                char flags_str[32] = "";
+                if (file_info[i].is_encrypted)
+                {
+                    if (g_encryption_enabled) {
+                        strcat(flags_str, "decrypted");
+                    }
+                    else {
+                        strcat(flags_str, "encrypted");
+                    }
+                }
+                if (file_info[i].is_compressed) strcat(flags_str, " decompressed");
+                printf("Successfully extracted: %s (%llu bytes)%s%s%s\n",
+                    output_file_path,
+                    (unsigned long long)write_pos,
+                    strlen(flags_str) > 0 ? " (" : "",
+                    flags_str,
+                    strlen(flags_str) > 0 ? ")" : "");
             }
         }
     }
@@ -1859,9 +2121,9 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
 // 打印使用帮助
 void print_usage(const char* progname) {
-    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption)\n");
+    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption and ZSTD compression)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-p <password>] <directory>   - Create archive\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-p <password>] [-z <level>] <directory>   - Create archive\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive>                  - Extract all files\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive> <files>          - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
@@ -1872,20 +2134,23 @@ void print_usage(const char* progname) {
     printf("                              Supported suffixes: K (KB), M (MB), G (GB)\n");
     printf("  -p, --password <password>   Set encryption password (AES-128 CBC)\n");
     printf("                              Password can be 16 hex bytes (32 chars) or any string\n");
+    printf("  -z, --compress <level>      Set ZSTD compression level (1-22, default: 3)\n");
+    printf("                              Use -z 0 to disable compression\n");
     printf("\nFeatures:\n");
     printf("  - Supports empty directories\n");
     printf("  - Supports empty files (0 bytes)\n");
+    printf("  - ZSTD compression (configurable level)\n");
     printf("  - AES-128 CBC encryption (data only, headers remain unencrypted)\n");
     printf("  - Each section uses its header CRC as IV\n");
     printf("\nExamples:\n");
     printf("  %s archive myfolder\n", progname);
     printf("  %s archive -o myarchive.lxar myfolder\n", progname);
-    printf("  %s archive -s 1M -p mypassword -o encrypted.lxar myfolder\n", progname);
+    printf("  %s archive -s 1M -p mypassword -z 5 -o encrypted_compressed.lxar myfolder\n", progname);
+    printf("  %s archive -z 0 myfolder                      # Disable compression\n", progname);
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
     printf("  %s extract -o extracted_files -p mypassword myfolder.lxar\n", progname);
     printf("  %s extract -o output_dir archive.lxar file1.txt file2.txt\n", progname);
 }
-
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -1899,30 +2164,50 @@ int main(int argc, char* argv[]) {
         int dir_index = 2;
         int password_index = -1;
         int output_index = -1;
+        int compress_index = -1;
 
         // 检查是否有各种选项
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--section-size") == 0) {
                 if (i + 1 < argc) {
                     g_section_size = parse_size(argv[i + 1]);
-                    i++; // 跳过size参数
+                    i++;
                 }
             }
             else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
                 if (i + 1 < argc) {
                     password_index = i + 1;
-                    i++; // 跳过password参数
+                    i++;
                 }
             }
             else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
                 if (i + 1 < argc) {
                     output_index = i + 1;
-                    i++; // 跳过output参数
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "-z") == 0 || strcmp(argv[i], "--compress") == 0) {
+                if (i + 1 < argc) {
+                    compress_index = i + 1;
+                    i++;
                 }
             }
             else {
                 dir_index = i;
                 break;
+            }
+        }
+
+        // 处理压缩级别
+        if (compress_index != -1) {
+            int level = parse_compression_level(argv[compress_index]);
+            if (level == 0) {
+                g_compression_enabled = 0;
+                printf("Compression disabled\n");
+            }
+            else {
+                g_compression_enabled = 1;
+                g_compression_level = level;
             }
         }
 
@@ -1962,13 +2247,13 @@ int main(int argc, char* argv[]) {
             if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
                 if (i + 1 < argc) {
                     password_index = i + 1;
-                    i++; // 跳过password参数
+                    i++;
                 }
             }
             else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
                 if (i + 1 < argc) {
                     output_index = i + 1;
-                    i++; // 跳过output参数
+                    i++;
                 }
             }
             else {
@@ -2012,7 +2297,7 @@ int main(int argc, char* argv[]) {
             if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
                 if (i + 1 < argc) {
                     password_index = i + 1;
-                    i++; // 跳过password参数
+                    i++;
                 }
             }
             else {
