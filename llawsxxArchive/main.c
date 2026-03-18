@@ -1,10 +1,10 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
 /*
- * lxar - LLawsXX ARchive format - Windows版本 (支持AES加密和ZSTD压缩)
+ * lxar - LLawsXX ARchive format - Windows版本 (支持AES加密、ZSTD压缩和分卷)
  *
  *
  * 使用方法:
- *   lxar archive [-o <输出文件>] [-s <size>] [-p <password>] [-z <level>] <目录>        - 创建归档
+ *   lxar archive [-o <输出文件>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] <目录>        - 创建归档
  *   lxar extract [-o <输出目录>] [-p <password>] <归档文件>                 - 提取所有文件
  *   lxar extract [-o <输出目录>] [-p <password>] <归档> <文件列表>          - 提取指定文件
  *   lxar list <归档>                        - 列出归档内容
@@ -21,16 +21,21 @@
 #include "aes.h"
 #include <windows.h>
 #include <direct.h>
-#include <zstd.h>  // 添加ZSTD头文件
+#include <zstd.h>
 #include <errno.h>
 
 #define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
 #define MIN_SECTION_SIZE (1024)            // 最小1KB
 #define MAX_SECTION_SIZE (64 * 1024 * 1024) // 最大64MB
 
+#define DEFAULT_VOLUME_SIZE (0)            // 默认不分卷
+#define MIN_VOLUME_SIZE (4 * 1024 * 1024)  // 最小分卷大小4MB
+#define MAX_VOLUME_SIZE (4LL * 1024 * 1024 * 1024 * 1024) // 最大4TB
+#define MAX_VOLUME_NUMBER 99999             // 最大分卷编号支持到99999
+
 #define MAGIC_NUMBER_FILE 0x424C4F43  // "BLOC" in ASCII
 #define MAGIC_NUMBER_DIR 0x44495200   // "DIR\0" in ASCII
-#define MAX_PATH_LEN 256
+#define MAX_PATH_LEN MAX_PATH
 #define CRC32_SIZE 4
 
  // 标志位定义
@@ -43,7 +48,7 @@
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;           // 4B Magic number (FILE or DIR)
-    char filename[256];       // 256B Filename
+    char filename[MAX_PATH_LEN];       // MAX_PATH_LEN Filename
     uint64_t mtime;           // 8B Modification time (UNIX timestamp)
     uint64_t total_size;      // 8B Total file size (0 for directories)
     uint64_t section_id;      // 8B Section ID (starts from 0)
@@ -59,7 +64,7 @@ typedef struct {
 #pragma pack(pop)
 
 typedef struct {
-    char filename[256];
+    char filename[MAX_PATH_LEN];
     uint64_t total_size;
     uint64_t actual_total_size;
     uint64_t section_count;
@@ -70,6 +75,28 @@ typedef struct {
     int is_encrypted;          // 是否加密
     int is_compressed;         // 是否压缩
 } FileInfo;
+
+// 分卷文件管理结构
+typedef struct {
+    FILE* current_file;        // 当前分卷文件句柄
+    char base_name[512];       // 基础文件名（不含分卷编号）
+    uint64_t volume_size;       // 分卷大小（字节，0表示不分卷）
+    uint64_t current_volume;    // 当前分卷编号（从1开始，不分卷时始终为1）
+    uint64_t current_pos;       // 当前分卷中的写入位置
+    int is_open;                // 当前文件是否打开
+    uint64_t total_written;     // 总共写入的数据量
+    int is_multi_volume;        // 是否多分卷模式
+} VolumeContext;
+
+typedef struct {
+    char current_file[512];     // 当前正在读取的文件名
+    char base_name[512];        // 基础文件名
+    uint64_t current_volume;     // 当前分卷编号
+    FILE* file;                 // 当前文件句柄
+    uint64_t file_size;         // 当前文件大小
+    int is_open;                // 是否打开
+    int is_multi_volume;        // 是否多分卷模式
+} VolumeReadContext;
 
 // 进度显示上下文结构体
 typedef struct {
@@ -91,8 +118,10 @@ typedef struct {
 // 全局变量
 int total_files_processed = 0;
 int total_dirs_processed = 0;
-FILE* g_archive = NULL;
+VolumeContext* g_vol_ctx = NULL;        // 分卷写入上下文指针
+VolumeReadContext* g_vol_read_ctx = NULL; // 分卷读取上下文指针
 uint32_t g_section_size = DEFAULT_SECTION_SIZE;  // 全局section size
+uint64_t g_volume_size = DEFAULT_VOLUME_SIZE;    // 分卷大小（0表示不分卷）
 uint8_t g_encryption_key[16] = { 0 };  // AES-128密钥
 int g_encryption_enabled = 0;        // 是否启用加密
 int g_compression_enabled = 1;        // 是否启用压缩（默认开启）
@@ -102,6 +131,12 @@ char g_output_path[MAX_PATH] = { 0 }; // 输出路径
 const char* g_input_root_path = NULL;
 int g_error_count = 0;           // 错误计数
 int g_warning_count = 0;         // 警告计数
+
+// 函数声明
+size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed);
+size_t archive_read(void* ptr, size_t size);
+int archive_seek(long long offset, int origin);
+long long archive_tell(void);
 
 // 初始化进度显示上下文
 void progress_init(ProgressContext* ctx, uint64_t total, uint64_t total_sections, const char* filename) {
@@ -267,7 +302,7 @@ uint64_t be64toh(uint64_t x) {
 // 将主机字节序的BlockHeader转换为大端字节序（用于写入）
 void header_host_to_be(const BlockHeader* host, BlockHeader* be) {
     be->magic = htobe32(host->magic);
-    memcpy(be->filename, host->filename, 256);
+    memcpy(be->filename, host->filename, MAX_PATH_LEN);
     be->mtime = htobe64(host->mtime);
     be->total_size = htobe64(host->total_size);
     be->section_id = htobe64(host->section_id);
@@ -282,7 +317,7 @@ void header_host_to_be(const BlockHeader* host, BlockHeader* be) {
 // 将大端字节序的BlockHeader转换为主机字节序（用于读取）
 void header_be_to_host(const BlockHeader* be, BlockHeader* host) {
     host->magic = be32toh(be->magic);
-    memcpy(host->filename, be->filename, 256);
+    memcpy(host->filename, be->filename, MAX_PATH_LEN);
     host->mtime = be64toh(be->mtime);
     host->total_size = be64toh(be->total_size);
     host->section_id = be64toh(be->section_id);
@@ -294,37 +329,89 @@ void header_be_to_host(const BlockHeader* be, BlockHeader* host) {
     host->original_size = be32toh(be->original_size);
 }
 
+size_t volume_write(VolumeContext* vol, const void* ptr, size_t size,int next_volume_if_needed);
+
+// 统一的写入函数（支持分卷和普通文件）
+size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed) {
+    if (!g_vol_ctx || !g_vol_ctx->is_open) {
+        printf("Error: Archive not open for writing\n");
+        return 0;
+    }
+
+    if (g_vol_ctx->is_multi_volume) {
+        // 多分卷模式
+        return volume_write(g_vol_ctx, ptr, size, next_volume_if_needed);
+    }
+    else {
+        // 单文件模式
+        size_t written = fwrite(ptr, 1, size, g_vol_ctx->current_file);
+        g_vol_ctx->current_pos += written;
+        g_vol_ctx->total_written += written;
+        return written;
+    }
+}
+
+// 统一的读取函数（支持分卷和普通文件）
+size_t archive_read(void* ptr, size_t size) {
+    if (!g_vol_read_ctx || !g_vol_read_ctx->is_open) {
+        printf("Error: Archive not open for reading\n");
+        return 0;
+    }
+
+    return fread(ptr, 1, size, g_vol_read_ctx->file);
+}
+
+// 统一的定位函数（支持分卷和普通文件）
+int archive_seek(long long offset, int origin) {
+    if (!g_vol_read_ctx || !g_vol_read_ctx->is_open) {
+        printf("Error: Archive not open for reading\n");
+        return -1;
+    }
+
+    return _fseeki64(g_vol_read_ctx->file, offset, origin);
+}
+
+// 统一的获取位置函数（支持分卷和普通文件）
+long long archive_tell(void) {
+    if (!g_vol_read_ctx || !g_vol_read_ctx->is_open) {
+        printf("Error: Archive not open for reading\n");
+        return -1;
+    }
+
+    return _ftelli64(g_vol_read_ctx->file);
+}
+
 // 写入CRC32（自动转换字节序）
-size_t write_crc32(FILE* file, uint32_t crc) {
+size_t write_crc32(uint32_t crc) {
     uint32_t crc_be = htobe32(crc);
-    return fwrite(&crc_be, sizeof(uint32_t), 1, file);
+    return archive_write(&crc_be, sizeof(uint32_t),0);
 }
 
 // 读取CRC32（自动转换字节序）
-int read_crc32(FILE* file, uint32_t* crc) {
+int read_crc32(uint32_t* crc) {
     *crc = 0;
     uint32_t crc_be;
-    size_t read = fread(&crc_be, sizeof(uint32_t), 1, file);
-    if (read != 1) return 0;
+    size_t read = archive_read(&crc_be, sizeof(uint32_t));
+    if (read != sizeof(uint32_t)) return 0;
     *crc = be32toh(crc_be);
     return 1;
 }
 
 // 写入整个BlockHeader（自动转换字节序）
-size_t write_block_header(FILE* file, BlockHeader* header) {
+size_t write_block_header(BlockHeader* header) {
     BlockHeader be_header;
     header_host_to_be(header, &be_header);
     uint32_t crc = crc32_calc(&be_header, sizeof(BlockHeader) - 4);
     be_header.header_crc32 = htobe32(crc);
     header->header_crc32 = crc;
-    return fwrite(&be_header, sizeof(BlockHeader), 1, file);
+    return archive_write(&be_header, sizeof(BlockHeader),1);
 }
 
 // 读取整个BlockHeader（自动转换字节序）
-int read_block_header(FILE* file, BlockHeader* header) {
+int read_block_header(BlockHeader* header) {
     BlockHeader be_header;
-    size_t read = fread(&be_header, sizeof(BlockHeader), 1, file);
-    if (read != 1) return 0;
+    size_t read = archive_read(&be_header, sizeof(BlockHeader));
+    if (read != sizeof(BlockHeader)) return 0;
     // 计算header CRC时不包括header_crc32字段
     uint32_t calc_header_crc32 = crc32_calc(&be_header, sizeof(BlockHeader) - 4);
     uint32_t crc = be32toh(be_header.header_crc32);
@@ -639,8 +726,8 @@ int is_directory(const char* path) {
     return 0;
 }
 
-// 解析size参数（支持K、M、G后缀）
-uint32_t parse_size(const char* size_str) {
+// 解析size参数（支持K、M、G、T后缀）
+uint64_t parse_size(const char* size_str) {
     char* endptr;
     unsigned long long size = strtoull(size_str, &endptr, 10);
 
@@ -658,11 +745,22 @@ uint32_t parse_size(const char* size_str) {
         case 'g':
             size *= 1024 * 1024 * 1024;
             break;
+        case 'T':
+        case 't':
+            size *= 1024LL * 1024 * 1024 * 1024;
+            break;
         default:
             printf("Warning: Unknown size suffix '%c', using as bytes\n", *endptr);
             break;
         }
     }
+
+    return size;
+}
+
+// 解析section size参数
+uint32_t parse_section_size(const char* size_str) {
+    uint64_t size = parse_size(size_str);
 
     // 检查范围
     if (size < MIN_SECTION_SIZE) {
@@ -677,6 +775,25 @@ uint32_t parse_size(const char* size_str) {
     }
 
     return (uint32_t)size;
+}
+
+// 解析分卷大小参数
+uint64_t parse_volume_size(const char* size_str) {
+    uint64_t size = parse_size(size_str);
+
+    // 检查范围
+    if (size < MIN_VOLUME_SIZE && size > 0) {
+        printf("Warning: Volume size too small (%llu bytes), using minimum %d MB\n",
+            size, MIN_VOLUME_SIZE / (1024 * 1024));
+        size = MIN_VOLUME_SIZE;
+    }
+    else if (size > MAX_VOLUME_SIZE) {
+        printf("Warning: Volume size too large (%llu bytes), using maximum 4TB\n",
+            size);
+        size = MAX_VOLUME_SIZE;
+    }
+
+    return size;
 }
 
 // 解析压缩级别参数
@@ -699,6 +816,63 @@ int parse_compression_level(const char* level_str) {
     }
 
     return (int)level;
+}
+
+// 生成分卷文件名
+void get_volume_filename(const char* base_name, uint64_t volume_num, char* out_name, size_t out_size) {
+    // 移除可能存在的.lxar后缀
+    char temp_base[512];
+    strncpy(temp_base, base_name, sizeof(temp_base) - 1);
+    temp_base[sizeof(temp_base) - 1] = '\0';
+
+    char* dot = strrchr(temp_base, '.');
+    if (dot && _stricmp(dot, ".lxar") == 0) {
+        *dot = '\0';
+    }
+
+    // 根据分卷编号决定格式
+    if (volume_num < 1000) {
+        snprintf(out_name, out_size, "%s.%03d.lxar", temp_base, (int)volume_num);
+    }
+    else {
+        // 对于超过999的分卷，使用更灵活的格式
+        snprintf(out_name, out_size, "%s.%llu.lxar", temp_base, (unsigned long long)volume_num);
+    }
+}
+
+// 解析分卷文件名，提取基础名和分卷编号
+int parse_volume_filename(const char* filename, char* base_name, size_t base_size, uint64_t* volume_num) {
+    char temp[512];
+    strncpy(temp, filename, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    // 查找最后一个.lxar
+    char* last_dot = strrchr(temp, '.');
+    if (!last_dot || _stricmp(last_dot, ".lxar") != 0) {
+        return -1;
+    }
+    *last_dot = '\0';  // 移除.lxar
+
+    // 查找最后一个点（分卷编号前的点）
+    char* vol_dot = strrchr(temp, '.');
+    if (!vol_dot) {
+        return -1;
+    }
+
+    // 尝试解析分卷编号
+    char* vol_str = vol_dot + 1;
+    char* endptr;
+    unsigned long long num = strtoull(vol_str, &endptr, 10);
+
+    if (*endptr != '\0' || num == 0) {
+        return -1;
+    }
+
+    // 成功解析分卷编号
+    *vol_dot = '\0';  // 移除分卷编号部分
+    strncpy(base_name, temp, base_size);
+    *volume_num = num;
+    return 0;
 }
 
 // 将Unix时间戳转换为可读的日期时间字符串
@@ -843,11 +1017,171 @@ void build_output_path(const char* output_root, const char* rel_path, char* out_
     }
 }
 
+// 分卷文件管理函数 - 打开下一个分卷
+int volume_open_next(VolumeContext* vol) {
+    if (vol->is_multi_volume && vol->current_volume >= MAX_VOLUME_NUMBER) {
+        printf("Error: Maximum volume number (%d) exceeded!\n", MAX_VOLUME_NUMBER);
+        return -1;
+    }
+
+    if (vol->current_file) {
+        fclose(vol->current_file);
+        vol->current_file = NULL;
+    }
+
+    vol->current_volume++;
+
+    char vol_name[512];
+    if (vol->is_multi_volume) {
+        get_volume_filename(vol->base_name, vol->current_volume, vol_name, sizeof(vol_name));
+        printf("Creating volume: %s\n", vol_name);
+    }
+    else {
+        // 单文件模式，直接使用基础名
+        strncpy(vol_name, vol->base_name, sizeof(vol_name) - 1);
+        vol_name[sizeof(vol_name) - 1] = '\0';
+        printf("Creating archive: %s\n", vol_name);
+    }
+
+    vol->current_file = fopen(vol_name, "wb");
+    if (!vol->current_file) {
+        printf("Error: Cannot create volume file: %s\n", vol_name);
+        return -1;
+    }
+
+    vol->current_pos = 0;
+    vol->is_open = 1;
+    return 0;
+}
+
+// 初始化分卷写入上下文
+int volume_init(VolumeContext* vol, const char* base_name, uint64_t volume_size) {
+    memset(vol, 0, sizeof(VolumeContext));
+    strncpy(vol->base_name, base_name, sizeof(vol->base_name) - 1);
+    vol->base_name[sizeof(vol->base_name) - 1] = '\0';
+
+    vol->volume_size = volume_size;
+    vol->current_volume = 0;
+    vol->current_pos = 0;
+    vol->total_written = 0;
+    vol->current_file = NULL;
+    vol->is_open = 0;
+    vol->is_multi_volume = (volume_size > 0);
+
+    // 打开第一个分卷
+    return volume_open_next(vol);
+}
+
+// 分卷写入数据
+size_t volume_write(VolumeContext* vol, const void* ptr, size_t size, int next_volume_if_needed) {
+    if (!vol->is_open || !vol->current_file) {
+        printf("Error: Volume not open for writing\n");
+        return 0;
+    }
+    int ret = 0;
+    const uint8_t* data = (const uint8_t*)ptr;
+
+    if (next_volume_if_needed && vol->current_pos >= vol->volume_size) {
+        ret = volume_open_next(vol);
+        if (ret != 0)
+            return 0;
+        vol->current_pos = 0;
+    }
+
+    size_t write_size = size;
+    size_t written = fwrite(data, 1, write_size, vol->current_file);
+    vol->current_pos += written;
+    vol->total_written += written;
+    return written;
+}
+
+// 关闭分卷
+void volume_close(VolumeContext* vol) {
+    if (vol->current_file) {
+        fclose(vol->current_file);
+        vol->current_file = NULL;
+    }
+    vol->is_open = 0;
+}
+
+// 分卷读取初始化
+int volume_read_init(VolumeReadContext* ctx, const char* archive_name) {
+    memset(ctx, 0, sizeof(VolumeReadContext));
+
+    // 解析文件名，获取基础名和分卷编号
+    if (parse_volume_filename(archive_name, ctx->base_name, sizeof(ctx->base_name), &ctx->current_volume) != 0) {
+        // 解析失败，直接使用原文件名
+        strncpy(ctx->base_name, archive_name, sizeof(ctx->base_name) - 1);
+        ctx->base_name[sizeof(ctx->base_name) - 1] = '\0';
+        ctx->current_volume = 1;
+        ctx->is_multi_volume = 0;
+    }
+    else {
+        ctx->is_multi_volume = 1;
+    }
+
+    strncpy(ctx->current_file, archive_name, sizeof(ctx->current_file) - 1);
+    ctx->current_file[sizeof(ctx->current_file) - 1] = '\0';
+
+    // 尝试打开文件
+    ctx->file = fopen(archive_name, "rb");
+    if (ctx->file) {
+        ctx->is_open = 1;
+        ctx->file_size = get_file_size(archive_name);
+        printf("Opened: %s", archive_name);
+        if (ctx->is_multi_volume) {
+            printf(" (volume %llu of multi-volume archive, base: %s)",
+                (unsigned long long)ctx->current_volume, ctx->base_name);
+        }
+        printf("\n");
+        return 0;
+    }
+
+    printf("Error: Cannot open archive file: %s\n", archive_name);
+    return -1;
+}
+
+// 分卷读取 - 打开下一个分卷
+int volume_read_next(VolumeReadContext* ctx) {
+    if (!ctx->is_multi_volume) {
+        return -1;  // 不是多分卷模式，没有下一个
+    }
+
+    if (ctx->file) {
+        fclose(ctx->file);
+        ctx->file = NULL;
+    }
+
+    ctx->current_volume++;
+
+    // 构建下一个分卷文件名
+    char next_vol[512];
+    get_volume_filename(ctx->base_name, ctx->current_volume, next_vol, sizeof(next_vol));
+
+    ctx->file = fopen(next_vol, "rb");
+    if (!ctx->file) {
+        return -1;  // 没有更多分卷
+    }
+
+    ctx->file_size = get_file_size(next_vol);
+    printf("Opening next volume: %s (volume %llu)\n", next_vol, (unsigned long long)ctx->current_volume);
+    return 0;
+}
+
+// 关闭分卷读取
+void volume_read_close(VolumeReadContext* ctx) {
+    if (ctx->file) {
+        fclose(ctx->file);
+        ctx->file = NULL;
+    }
+    ctx->is_open = 0;
+}
+
 // 验证块头的有效性
 int validate_block_header(BlockHeader* header, long long found_pos, long long start_pos, uint64_t* block_num) {
     if (header->magic != MAGIC_NUMBER_FILE && header->magic != MAGIC_NUMBER_DIR) {
         printf("Error: Invalid magic number 0x%08x at position %llu\n",
-            header->magic, (unsigned long long)_ftelli64(g_archive) - sizeof(BlockHeader));
+            header->magic, (unsigned long long)archive_tell() - sizeof(BlockHeader));
         return -1;
     }
 
@@ -873,7 +1207,7 @@ int validate_block_header(BlockHeader* header, long long found_pos, long long st
 }
 
 // 扫描并定位下一个magic number
-long long find_next_magic(FILE* archive, long long start_pos, long long file_size) {
+long long find_next_magic(FILE* file, long long start_pos, long long file_size) {
     unsigned char byte;
     long long pos = start_pos;
     uint32_t magic_accumulator = 0;
@@ -882,14 +1216,14 @@ long long find_next_magic(FILE* archive, long long start_pos, long long file_siz
         return -1;
     }
 
-    _fseeki64(archive, pos, SEEK_SET);
+    _fseeki64(file, pos, SEEK_SET);
 
-    while (fread(&byte, 1, 1, archive) == 1) {
+    while (fread(&byte, 1, 1, file) == 1) {
         magic_accumulator = ((magic_accumulator << 8) & 0xFFFFFF00) | byte;
 
         if (magic_accumulator == MAGIC_NUMBER_FILE || magic_accumulator == MAGIC_NUMBER_DIR) {
             long long found_pos = pos - 3;
-            _fseeki64(archive, found_pos, SEEK_SET);
+            _fseeki64(file, found_pos, SEEK_SET);
             return found_pos;
         }
 
@@ -902,7 +1236,7 @@ long long find_next_magic(FILE* archive, long long start_pos, long long file_siz
 // 处理目录的回调函数
 void process_directory(const char* dirpath) {
     // 获取相对于输入根目录的路径
-    char relative_path[256] = { 0 };
+    char relative_path[MAX_PATH_LEN] = { 0 };
 
     if (get_relative_path(dirpath, g_input_root_path, relative_path, sizeof(relative_path)) != 0) {
         printf("Warning: Path issue for directory %s\n", dirpath);
@@ -913,12 +1247,12 @@ void process_directory(const char* dirpath) {
     // 确保目录名以/结尾
     size_t len = strlen(relative_path);
     if (len > 0 && relative_path[len - 1] != '/') {
-        if (len < 255) {
+        if (len < MAX_PATH_LEN - 1) {
             relative_path[len] = '/';
             relative_path[len + 1] = '\0';
         }
     }
-    relative_path[255] = '\0';
+    relative_path[MAX_PATH_LEN - 1] = '\0';
 
     // 获取目录信息
     struct __stat64 st;
@@ -933,8 +1267,8 @@ void process_directory(const char* dirpath) {
     // 创建目录块
     BlockHeader header = { 0 };
     header.magic = MAGIC_NUMBER_DIR;
-    strncpy(header.filename, relative_path, 255);
-    header.filename[255] = '\0';
+    strncpy(header.filename, relative_path, MAX_PATH_LEN - 1);
+    header.filename[MAX_PATH_LEN - 1] = '\0';
     header.mtime = st.st_mtime;
     header.total_size = 0;
     header.section_id = 0;
@@ -944,15 +1278,15 @@ void process_directory(const char* dirpath) {
     header.flags = 0;
     header.original_size = 0;
 
-    // 使用封装函数写入（自动转换字节序）
-    if (write_block_header(g_archive, &header) != 1) {
+    // 写入块头
+    if (write_block_header(&header) != sizeof(BlockHeader)) {
         printf("Error: Failed to write directory header for %s\n", relative_path);
         g_error_count++;
         return;
     }
 
     // 目录没有数据块，直接写入CRC32（全0）
-    if (write_crc32(g_archive, 0) != 1) {
+    if (write_crc32(0) != sizeof(uint32_t)) {
         printf("Error: Failed to write CRC for directory %s\n", relative_path);
         g_error_count++;
         return;
@@ -980,13 +1314,13 @@ void process_file(const char* filepath) {
     }
 
     // 获取相对于输入根目录的路径
-    char relative_path[256] = { 0 };
+    char relative_path[MAX_PATH_LEN] = { 0 };
     if (get_relative_path(filepath, g_input_root_path, relative_path, sizeof(relative_path)) != 0) {
         printf("Warning: Path issue for %s\n", filepath);
         g_warning_count++;
         // 继续处理，使用可能不完整的路径
     }
-    relative_path[255] = '\0';
+    relative_path[MAX_PATH_LEN - 1] = '\0';
 
     long long file_size = st.st_size;
 
@@ -996,8 +1330,8 @@ void process_file(const char* filepath) {
 
         BlockHeader header = { 0 };
         header.magic = MAGIC_NUMBER_FILE;
-        strncpy(header.filename, relative_path, 255);
-        header.filename[255] = '\0';
+        strncpy(header.filename, relative_path, MAX_PATH_LEN - 1);
+        header.filename[MAX_PATH_LEN - 1] = '\0';
         header.mtime = st.st_mtime;
         header.total_size = 0;
         header.section_id = 0;
@@ -1009,8 +1343,8 @@ void process_file(const char* filepath) {
         header.data_offset = 0;
         header.original_size = 0;
 
-        // 使用封装函数写入（自动转换字节序）
-        if (write_block_header(g_archive, &header) != 1) {
+        // 写入块头
+        if (write_block_header(&header) != sizeof(BlockHeader)) {
             printf("Error: Failed to write file header for %s\n", relative_path);
             fclose(infile);
             g_error_count++;
@@ -1018,7 +1352,7 @@ void process_file(const char* filepath) {
         }
 
         // 空文件没有数据，直接写入CRC32（全0）
-        if (write_crc32(g_archive, 0) != 1) {
+        if (write_crc32(0) != sizeof(uint32_t)) {
             printf("Error: Failed to write CRC for empty file %s\n", relative_path);
             fclose(infile);
             g_error_count++;
@@ -1096,8 +1430,6 @@ void process_file(const char* filepath) {
                         free(compressed_data);
                         // 更新压缩率信息（未压缩，比例为1:1）
                         progress_update_compression(&progress, section_size, section_size);
-                        //printf("Debug: Section %llu compression ratio not beneficial, using original (zstd_compressed_len %lld section_size %u)\n",
-                        //    (unsigned long long)section_id, zstd_compressed_len, section_size);
                     }
                 }
             }
@@ -1125,8 +1457,8 @@ void process_file(const char* filepath) {
 
             BlockHeader header = { 0 };
             header.magic = MAGIC_NUMBER_FILE;
-            strncpy(header.filename, relative_path, 255);
-            header.filename[255] = '\0';
+            strncpy(header.filename, relative_path, MAX_PATH_LEN - 1);
+            header.filename[MAX_PATH_LEN - 1] = '\0';
             header.mtime = st.st_mtime;
             header.total_size = file_size;
             header.section_id = section_id;
@@ -1139,7 +1471,7 @@ void process_file(const char* filepath) {
             header.original_size = original_len;  // 保存原始大小用于解压缩
 
             // 写入块头
-            if (write_block_header(g_archive, &header) != 1) {
+            if (write_block_header(&header) != sizeof(BlockHeader)) {
                 printf("Error: Failed to write file header for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1161,7 +1493,7 @@ void process_file(const char* filepath) {
             crc32_update(&ctx, data_to_write, data_to_write_len);
 
             // 写入数据
-            if (fwrite(data_to_write, 1, data_to_write_len, g_archive) != data_to_write_len) {
+            if (archive_write(data_to_write, data_to_write_len,0) != data_to_write_len) {
                 printf("Error: Failed to write data for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1173,7 +1505,7 @@ void process_file(const char* filepath) {
             uint32_t crc = crc32_final(&ctx);
 
             // 写入CRC32
-            if (write_crc32(g_archive, crc) != 1) {
+            if (write_crc32(crc) != sizeof(uint32_t)) {
                 printf("Error: Failed to write CRC for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1206,7 +1538,7 @@ void process_file(const char* filepath) {
     fclose(infile);
 }
 
-// 创建归档文件
+// 创建归档文件（支持分卷）
 int create_archive(const char* archive_name, const char* input_path) {
     // 检查输入路径是否存在
     if (!is_directory(input_path)) {
@@ -1214,9 +1546,12 @@ int create_archive(const char* archive_name, const char* input_path) {
         return -1;
     }
 
-    g_archive = fopen(archive_name, "wb");
-    if (!g_archive) {
-        printf("Error: Cannot create archive file: %s\n", archive_name);
+    VolumeContext vol_ctx;
+    g_vol_ctx = &vol_ctx;  // 设置全局分卷写入上下文指针
+
+    // 初始化分卷
+    if (volume_init(&vol_ctx, archive_name, g_volume_size) != 0) {
+        g_vol_ctx = NULL;
         return -1;
     }
 
@@ -1237,12 +1572,24 @@ int create_archive(const char* archive_name, const char* input_path) {
     }
     g_input_root_path = input_root;
 
-    printf("Creating archive: %s\n", archive_name);
+    if (g_volume_size > 0) {
+        printf("Creating multi-volume archive, base name: %s\n", archive_name);
+        printf("Volume size: %llu bytes (%.2f MB, %.2f GB)\n",
+            (unsigned long long)g_volume_size,
+            g_volume_size / (1024.0 * 1024.0),
+            g_volume_size / (1024.0 * 1024.0 * 1024.0));
+        printf("Maximum volumes supported: %d\n", MAX_VOLUME_NUMBER);
+    }
+    else {
+        printf("Creating archive: %s\n", archive_name);
+    }
+
     printf("Input path: %s\n", input_path);
     printf("Section size: %u bytes (%.2f KB, %.2f MB)\n",
         g_section_size,
         g_section_size / 1024.0,
         g_section_size / (1024.0 * 1024.0));
+
     if (g_encryption_enabled) {
         printf("Encryption: AES-128 CBC enabled\n");
     }
@@ -1253,13 +1600,23 @@ int create_archive(const char* archive_name, const char* input_path) {
     // Windows下使用自定义目录遍历，先处理目录，再处理文件
     walk_directory(input_path, process_file, process_directory);
 
-    fclose(g_archive);
+    // 关闭文件
+    volume_close(&vol_ctx);
+    g_vol_ctx = NULL;
 
     // 输出最终统计
     printf("\nArchive creation completed:\n");
     printf("  - Directories: %d\n", total_dirs_processed);
     printf("  - Files: %d (including empty files)\n", total_files_processed);
     printf("  - Total: %d\n", total_files_processed + total_dirs_processed);
+
+    if (g_volume_size > 0) {
+        printf("  - Volumes: %llu\n", (unsigned long long)vol_ctx.current_volume);
+        printf("  - Total size: %llu bytes (%.2f MB, %.2f GB)\n",
+            (unsigned long long)vol_ctx.total_written,
+            vol_ctx.total_written / (1024.0 * 1024.0),
+            vol_ctx.total_written / (1024.0 * 1024.0 * 1024.0));
+    }
 
     if (g_warning_count > 0) {
         printf("  - Warnings: %d\n", g_warning_count);
@@ -1271,24 +1628,24 @@ int create_archive(const char* archive_name, const char* input_path) {
         return -1;
     }
     else {
-        printf("Archive created successfully: %s\n", archive_name);
+        printf("Archive created successfully.\n");
         return 0;
     }
 }
 
-// 列出归档内容
+// 列出归档内容（支持分卷）
 int list_archive(const char* archive_name) {
-    FILE* archive = fopen(archive_name, "rb");
-    if (!archive) {
-        printf("Cannot open archive file: %s\n", archive_name);
+    VolumeReadContext vol_ctx;
+    if (volume_read_init(&vol_ctx, archive_name) != 0) {
         return -1;
     }
+    g_vol_read_ctx = &vol_ctx;
 
     BlockHeader header;
     uint64_t total_files = 0;
     uint64_t total_dirs = 0;
     uint64_t total_blocks = 0;
-    char current_file[256] = { 0 };
+    char current_file[MAX_PATH_LEN] = { 0 };
     long long start_pos = 0;
     long long pos = 0;
     int result;
@@ -1296,7 +1653,7 @@ int list_archive(const char* archive_name) {
 
     // 用于跟踪哪些文件已经显示过
     typedef struct {
-        char filename[256];
+        char filename[MAX_PATH_LEN];
         int displayed;
         uint64_t total_size;
         uint64_t total_sections;
@@ -1309,17 +1666,28 @@ int list_archive(const char* archive_name) {
     int displayed_count = 0;
     int displayed_capacity = 0;
 
-    printf("Archive contents: %s\n", archive_name);
+    printf("Archive contents:\n");
+    if (vol_ctx.is_multi_volume) {
+        printf("Multi-volume archive, base name: %s\n", vol_ctx.base_name);
+    }
     printf("%-30s %-20s %-10s %-10s %-12s %s\n", "Name", "Modified Time", "Type", "Size", "Flags", "CRC");
     printf("------------------------------------------------\n");
 
-    long long filesize = get_file_size(archive_name);
+    long long filesize = vol_ctx.file_size;
 
     while (1) {
-        pos = find_next_magic(archive, start_pos, filesize);
-        if (pos == -1) break;
+        pos = find_next_magic(vol_ctx.file, start_pos, filesize);
+        if (pos == -1) {
+            // 尝试下一个分卷
+            if (volume_read_next(&vol_ctx) != 0) {
+                break;  // 没有更多分卷
+            }
+            start_pos = 0;
+            filesize = vol_ctx.file_size;
+            continue;
+        }
 
-        if (!read_block_header(archive, &header)) {
+        if (!read_block_header(&header)) {
             // 头损坏的情况
             printf("%-30s %-20s %-10s %-10s %-12s %s\n",
                 "[CORRUPTED BLOCK]", "", "ERROR", "", "", "HEADER CRC FAILED");
@@ -1339,12 +1707,12 @@ int list_archive(const char* archive_name) {
 
         if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
             // 普通文件：跳过数据块后读CRC
-            _fseeki64(archive, header.section_size, SEEK_CUR);
-            read_crc32(archive, &stored_crc);
+            archive_seek(header.section_size, SEEK_CUR);
+            read_crc32(&stored_crc);
         }
         else {
             // 目录或空文件：直接读CRC（位于头之后）
-            read_crc32(archive, &stored_crc);
+            read_crc32(&stored_crc);
         }
 
         // 格式化时间
@@ -1413,7 +1781,7 @@ int list_archive(const char* archive_name) {
             }
         }
 
-        start_pos = _ftelli64(archive);
+        start_pos = archive_tell();
     }
 
     printf("------------------------------------------------\n");
@@ -1423,17 +1791,18 @@ int list_archive(const char* archive_name) {
         (unsigned long long)total_blocks);
 
     free(displayed_files);
-    fclose(archive);
+    volume_read_close(&vol_ctx);
+    g_vol_read_ctx = NULL;
     return 0;
 }
 
-// 验证归档完整性
+// 验证归档完整性（支持分卷）
 int verify_archive(const char* archive_name) {
-    FILE* archive = fopen(archive_name, "rb");
-    if (!archive) {
-        printf("Cannot open archive file: %s\n", archive_name);
+    VolumeReadContext vol_ctx;
+    if (volume_read_init(&vol_ctx, archive_name) != 0) {
         return -1;
     }
+    g_vol_read_ctx = &vol_ctx;
 
     BlockHeader header;
     uint64_t block_num = 0;
@@ -1445,7 +1814,7 @@ int verify_archive(const char* archive_name) {
 
     // 用于跟踪文件信息
     typedef struct {
-        char filename[256];
+        char filename[MAX_PATH_LEN];
         uint64_t total_sections;
         uint64_t found_sections;
         uint64_t first_section_id_found;
@@ -1461,19 +1830,30 @@ int verify_archive(const char* archive_name) {
     int file_capacity = 0;
 
     printf("Verifying archive: %s\n", archive_name);
+    if (vol_ctx.is_multi_volume) {
+        printf("Multi-volume archive detected. Base name: %s\n", vol_ctx.base_name);
+    }
     if (g_encryption_enabled) {
         printf("Decryption enabled for verification\n");
     }
     printf("%-30s %-20s %-10s %s\n", "Name", "Modified Time", "Type", "Status");
     printf("------------------------------------------------\n");
 
-    long long filesize = get_file_size(archive_name);
+    long long filesize = vol_ctx.file_size;
 
     while (1) {
-        pos = find_next_magic(archive, start_pos, filesize);
-        if (pos == -1) break;
+        pos = find_next_magic(vol_ctx.file, start_pos, filesize);
+        if (pos == -1) {
+            // 尝试下一个分卷
+            if (volume_read_next(&vol_ctx) != 0) {
+                break;  // 没有更多分卷
+            }
+            start_pos = 0;
+            filesize = vol_ctx.file_size;
+            continue;
+        }
 
-        if (!read_block_header(archive, &header)) {
+        if (!read_block_header(&header)) {
             start_pos = pos + 1;
             continue;
         }
@@ -1534,7 +1914,7 @@ int verify_archive(const char* archive_name) {
         if (header.magic == MAGIC_NUMBER_DIR) {
             // 目录：只有CRC
             uint32_t stored_crc;
-            read_crc32(archive, &stored_crc);
+            read_crc32(&stored_crc);
             if (stored_crc != 0) {
                 printf("%-30s %-20s %-10s %s (CRC: 0x%08x)\n",
                     header.filename, datetime_str, "<DIR>",
@@ -1550,7 +1930,7 @@ int verify_archive(const char* archive_name) {
             if (header.section_size == 0) {
                 // 空文件
                 uint32_t stored_crc;
-                read_crc32(archive, &stored_crc);
+                read_crc32(&stored_crc);
                 if (stored_crc != 0) {
                     printf("%-30s %-20s %-10s %s (CRC: 0x%08x)\n",
                         header.filename, datetime_str, "<EMPTY>",
@@ -1572,12 +1952,13 @@ int verify_archive(const char* archive_name) {
                 uint8_t* data_buffer = (uint8_t*)malloc(header.section_size);
                 if (!data_buffer) {
                     printf("Error: Out of memory\n");
-                    fclose(archive);
+                    volume_read_close(&vol_ctx);
                     free(file_info);
+                    g_vol_read_ctx = NULL;
                     return -1;
                 }
 
-                size_t actual_read = fread(data_buffer, 1, header.section_size, archive);
+                size_t actual_read = archive_read(data_buffer, header.section_size);
                 if (header.section_size - actual_read > 0) {
                     printf("Warning: Short read for %s\n", header.filename);
                     memset(data_buffer + actual_read, 0, header.section_size - actual_read);
@@ -1602,7 +1983,7 @@ int verify_archive(const char* archive_name) {
 
                 // 读取存储的CRC
                 uint32_t stored_crc;
-                read_crc32(archive, &stored_crc);
+                read_crc32(&stored_crc);
                 free(data_buffer);
 
                 // 显示每个section的状态
@@ -1636,7 +2017,7 @@ int verify_archive(const char* archive_name) {
             }
         }
 
-        start_pos = _ftelli64(archive);
+        start_pos = archive_tell();
     }
 
     // 检查文件的完整性（section连续性）
@@ -1674,11 +2055,11 @@ int verify_archive(const char* archive_name) {
             if (file_issues == 0 && !file_info[i].is_corrupted) {
                 char flags_str[32] = "";
                 if (file_info[i].is_encrypted) strcat(flags_str, "encrypted");
-                if (file_info[i].is_compressed) { 
+                if (file_info[i].is_compressed) {
                     if (file_info[i].is_encrypted) {
                         strcat(flags_str, " ");
                     }
-                    strcat(flags_str, "compressed"); 
+                    strcat(flags_str, "compressed");
                 }
                 if (strlen(flags_str) > 0) {
                     printf("OK: %s - All %llu sections present and intact (%s)\n",
@@ -1696,7 +2077,8 @@ int verify_archive(const char* archive_name) {
     }
 
     printf("------------------------------------------------\n");
-    fclose(archive);
+    volume_read_close(&vol_ctx);
+    g_vol_read_ctx = NULL;
     free(file_info);
 
     if (corrupted_blocks == 0 && missing_first_blocks == 0) {
@@ -1712,426 +2094,547 @@ int verify_archive(const char* archive_name) {
     }
 }
 
-// 提取文件
+
+// 用于跟踪当前正在提取的文件
+typedef struct {
+    char filename[MAX_PATH_LEN];
+    FILE* outfile;
+    uint64_t expected_size;
+    uint64_t current_size;
+    uint64_t expected_section_id;
+    uint64_t total_sections;
+    int is_encrypted;
+    int is_compressed;
+    int corrupted;
+    int found;
+    ProgressContext progress;
+} ExtractingFile;
+
+
+// 提取文件（支持分卷）
+void cleanup_extracting_files(ExtractingFile* files, int count, VolumeReadContext* ctx) {
+    if (files) {
+        for (int i = 0; i < count; i++) {
+            if (files[i].outfile) {
+                fclose(files[i].outfile);
+                files[i].outfile = NULL;
+            }
+        }
+        free(files);
+    }
+    if (ctx) {
+        volume_read_close(ctx);
+    }
+    g_vol_read_ctx = NULL;
+}
+
 int extract_archive(const char* archive_name, char** files, int file_count) {
-    FILE* archive = fopen(archive_name, "rb");
-    if (!archive) {
-        printf("Cannot open archive file: %s\n", archive_name);
-        return -1;
+    VolumeReadContext vol_ctx;
+
+    // 检查是否需要提取所有文件
+    // 如果 file_count == 0，表示提取所有文件
+    int extract_all = (file_count == 0);
+
+    if (extract_all) {
+        printf("Extracting all files\n");
+    }
+    else {
+        printf("Files to extract:\n");
+        for (int i = 0; i < file_count; i++) {
+            printf("  %s\n", files[i]);
+        }
     }
 
+    if (g_output_path[0] != '\0') {
+        printf("Output directory: %s\n", g_output_path);
+        create_directories(g_output_path);
+    }
+
+    // 用于统计
+    int extracted_count = 0;
+    int corrupted_files = 0;
+    int file_not_found = 0;
+    int total_file_in_archive = 0;
+    int total_dir_in_archive = 0;
+
+    printf("\nScanning archive and extracting files...\n");
+
+    ExtractingFile* extracting_files = NULL;
+    int extracting_count = 0;
+    int extracting_capacity = 0;
+
+    // 如果不是提取所有文件，初始化提取文件列表
+    if (!extract_all) {
+        extracting_capacity = file_count;
+        extracting_files = (ExtractingFile*)calloc(extracting_capacity, sizeof(ExtractingFile));
+        if (!extracting_files) {
+            printf("Error: Out of memory\n");
+            return -1;
+        }
+        extracting_count = file_count;
+        for (int i = 0; i < file_count; i++) {
+            strncpy(extracting_files[i].filename, files[i], MAX_PATH_LEN - 1);
+            extracting_files[i].filename[MAX_PATH_LEN - 1] = '\0';
+            extracting_files[i].outfile = NULL;
+            extracting_files[i].expected_size = 0;
+            extracting_files[i].current_size = 0;
+            extracting_files[i].expected_section_id = 0;
+            extracting_files[i].total_sections = 0;
+            extracting_files[i].is_encrypted = 0;
+            extracting_files[i].is_compressed = 0;
+            extracting_files[i].corrupted = 0;
+            extracting_files[i].found = 0;
+        }
+    }
+
+    // 开始扫描归档
+    if (volume_read_init(&vol_ctx, archive_name) != 0) {
+        if (extracting_files) free(extracting_files);
+        return -1;
+    }
+    g_vol_read_ctx = &vol_ctx;
+
     BlockHeader header;
-    FileInfo* file_info = NULL;
-    int file_info_count = 0;
-    int file_info_capacity = 0;
     long long start_pos = 0;
     long long pos = 0;
     uint64_t block_num = 0;
     int result;
+    char datetime_str[20];
 
-    printf("Scanning archive: %s\n", archive_name);
-    if (g_encryption_enabled) {
-        printf("Decryption enabled for extraction\n");
-    }
-    if (g_output_path[0] != '\0') {
-        printf("Output directory: %s\n", g_output_path);
-    }
-
-    // 先扫描归档，收集文件信息
-    long long filesize = get_file_size(archive_name);
+    long long filesize = vol_ctx.file_size;
 
     while (1) {
-        pos = find_next_magic(archive, start_pos, filesize);
-        if (pos == -1) break;
+        // 查找下一个块
+        pos = find_next_magic(vol_ctx.file, start_pos, filesize);
+        if (pos == -1) {
+            // 尝试下一个分卷
+            if (volume_read_next(&vol_ctx) != 0) {
+                break;  // 没有更多分卷
+            }
+            start_pos = 0;
+            filesize = vol_ctx.file_size;
+            continue;
+        }
 
-        if (!read_block_header(archive, &header)) {
+        // 读取块头
+        if (!read_block_header(&header)) {
             start_pos = pos + 1;
             continue;
         }
 
-        // 使用公共函数验证块头
+        // 验证块头
         result = validate_block_header(&header, pos, start_pos, &block_num);
         if (result < 0) {
             start_pos = pos + 1;
             continue;
         }
 
-        // 记录文件/目录信息
-        int found = -1;
-        for (int i = 0; i < file_info_count; i++) {
-            if (strcmp(file_info[i].filename, header.filename) == 0) {
-                found = i;
-                break;
-            }
-        }
+        // 格式化时间（用于显示）
+        format_datetime(header.mtime, datetime_str, sizeof(datetime_str));
 
-        if (found == -1) {
-            // 新文件或目录
-            if (file_info_count >= file_info_capacity) {
-                file_info_capacity = file_info_capacity ? file_info_capacity * 2 : 16;
-                file_info = (FileInfo*)realloc(file_info, file_info_capacity * sizeof(FileInfo));
-                if (!file_info) {
-                    printf("Error: Out of memory\n");
-                    break;
+        // 处理目录
+        if (header.magic == MAGIC_NUMBER_DIR) {
+            total_dir_in_archive++;
+            // 读取CRC并跳过
+            uint32_t stored_crc;
+            read_crc32(&stored_crc);
+
+            // 如果需要提取所有文件，创建目录
+            if (extract_all) {
+                char dir_path[MAX_PATH_LEN];
+                strcpy(dir_path, header.filename);
+                // 移除末尾的'/'
+                size_t len = strlen(dir_path);
+                if (len > 0 && dir_path[len - 1] == '/') {
+                    dir_path[len - 1] = '\0';
                 }
-            }
-            found = file_info_count++;
-            strcpy(file_info[found].filename, header.filename);
-            file_info[found].total_size = header.total_size;
-            file_info[found].actual_total_size = 0;
-            file_info[found].section_count = header.total_section_count;
-            file_info[found].actual_section_count = 0;
-            file_info[found].next_desired_section_id = 0;
-            file_info[found].first_block_offset = _ftelli64(archive) - sizeof(BlockHeader);
-            file_info[found].is_directory = (header.magic == MAGIC_NUMBER_DIR);
-            file_info[found].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
-            file_info[found].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
-        }
-        file_info[found].actual_section_count++;
 
-        // 跳过数据块和CRC
-        if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
-            _fseeki64(archive, header.section_size + CRC32_SIZE, SEEK_CUR);
-        }
-        else {
-            // 目录或空文件：只有CRC
-            _fseeki64(archive, CRC32_SIZE, SEEK_CUR);
-        }
-
-        start_pos = _ftelli64(archive);
-    }
-
-    printf("Found %d items in archive\n", file_info_count);
-
-    // 检查是否需要提取所有文件
-    int extract_all = (file_count == 0);
-    if (!extract_all) {
-        // 验证指定的文件是否存在
-        for (int i = 0; i < file_count; i++) {
-            int found = 0;
-            for (int j = 0; j < file_info_count; j++) {
-                if (strstr(file_info[j].filename, files[i]) != NULL) {
-                    found = 1;
-                    printf("Found: %s\n", file_info[j].filename);
-                    break;
-                }
-            }
-            if (!found) {
-                printf("Warning: File '%s' not found\n", files[i]);
-            }
-        }
-    }
-
-    // 先创建所有目录
-    printf("Creating directory structure...\n");
-    for (int i = 0; i < file_info_count; i++) {
-        if (file_info[i].is_directory) {
-            char dir_path[256];
-            strcpy(dir_path, file_info[i].filename);
-            // 移除末尾的'/'
-            size_t len = strlen(dir_path);
-            if (len > 0 && dir_path[len - 1] == '/') {
-                dir_path[len - 1] = '\0';
+                printf("Creating directory: %s\n", dir_path);
+                create_directories_with_root(g_output_path, dir_path);
             }
 
-            printf("Creating directory: %s\n", dir_path);
-            create_directories_with_root(g_output_path, dir_path);
-        }
-    }
-
-    // 提取文件
-    int corrupted_files = 0;
-    for (int i = 0; i < file_info_count; i++) {
-        // 跳过目录
-        if (file_info[i].is_directory) continue;
-
-        // 检查是否需要提取这个文件
-        int should_extract = extract_all;
-        if (!should_extract) {
-            for (int j = 0; j < file_count; j++) {
-                if (strstr(file_info[i].filename, files[j]) != NULL) {
-                    should_extract = 1;
-                    break;
-                }
-            }
-        }
-
-        if (!should_extract) continue;
-
-        printf("Extracting: %s%s%s\n", file_info[i].filename,
-            file_info[i].is_encrypted ? " (encrypted)" : "",
-            file_info[i].is_compressed ? " (compressed)" : "");
-
-        // 构建输出文件路径
-        char output_file_path[MAX_PATH];
-        build_output_path(g_output_path, file_info[i].filename, output_file_path, sizeof(output_file_path));
-
-        // 创建文件所在的目录
-        char* dir_path = strdup(output_file_path);
-        char* dir = dirname(dir_path);
-        if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
-            create_directories(dir);
-        }
-        free(dir_path);
-
-        // 打开输出文件
-        FILE* outfile = fopen(output_file_path, "wb");
-        if (!outfile) {
-            printf("Error: Cannot create file %s\n", output_file_path);
+            start_pos = archive_tell();
             continue;
         }
 
-        // 定位到第一个块
-        _fseeki64(archive, file_info[i].first_block_offset, SEEK_SET);
-        start_pos = file_info[i].first_block_offset;
+        // 处理文件
+        if (header.magic == MAGIC_NUMBER_FILE) {
+            int should_extract = extract_all;
+            int file_index = -1;
 
-        uint64_t write_pos = 0;
-        int file_corrupted = 0;
-        block_num = 0;
+            if (!extract_all) {
+                // 检查是否需要提取这个文件
+                for (int i = 0; i < extracting_count; i++) {
+                    // 简单的子串匹配，也可以改为精确匹配
+                    if (strcmp(header.filename, extracting_files[i].filename) == 0) {
+                        should_extract = 1;
+                        file_index = i;
+                        extracting_files[i].found = 1;
+                        break;
+                    }
+                }
+            }
+            else {
+                // 提取所有文件，需要动态分配 extracting_files
+                // 检查是否已有这个文件的记录
+                for (int i = 0; i < extracting_count; i++) {
+                    if (strcmp(extracting_files[i].filename, header.filename) == 0) {
+                        file_index = i;
+                        should_extract = 1;
+                        break;
+                    }
+                }
 
-        // 检查section数量（对于非空文件）
-        if (file_info[i].total_size > 0 &&
-            file_info[i].section_count != file_info[i].actual_section_count) {
-            file_corrupted = 1;
-            printf("Warning: File '%s' corrupted, desired section count %llu, but only get %llu\n",
-                file_info[i].filename, file_info[i].section_count, file_info[i].actual_section_count);
-        }
+                // 如果是新文件，添加到列表
+                if (file_index == -1) {
+                    if (extracting_count >= extracting_capacity) {
+                        extracting_capacity = extracting_capacity ? extracting_capacity * 2 : 16;
+                        ExtractingFile* new_files = (ExtractingFile*)realloc(extracting_files,
+                            extracting_capacity * sizeof(ExtractingFile));
+                        if (!new_files) {
+                            printf("Error: Out of memory while adding new file, aborting extraction\n");
+                            cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
+                            return -1;
+                        }
+                        extracting_files = new_files;
+                        memset(&extracting_files[extracting_count], 0,
+                            (extracting_capacity - extracting_count) * sizeof(ExtractingFile));
+                    }
 
-        // 初始化进度显示上下文
-        ProgressContext progress;
-        progress_init(&progress, file_info[i].total_size, file_info[i].actual_section_count, file_info[i].filename);
+                    file_index = extracting_count;
+                    extracting_count++;
+                    strncpy(extracting_files[file_index].filename, header.filename, MAX_PATH_LEN - 1);
+                    extracting_files[file_index].filename[MAX_PATH_LEN - 1] = '\0';
+                    extracting_files[file_index].outfile = NULL;
+                    extracting_files[file_index].expected_size = 0;
+                    extracting_files[file_index].current_size = 0;
+                    extracting_files[file_index].expected_section_id = 0;
+                    extracting_files[file_index].total_sections = 0;
+                    extracting_files[file_index].is_encrypted = 0;
+                    extracting_files[file_index].is_compressed = 0;
+                    extracting_files[file_index].corrupted = 0;
+                    extracting_files[file_index].found = 1;
 
-        for (uint64_t sid = 0; sid < file_info[i].actual_section_count; sid++) {
-            BlockHeader header;
-            pos = find_next_magic(archive, start_pos, filesize);
-            if (pos == -1) break;
+                    should_extract = 1;
+                }
+            }
 
-            if (!read_block_header(archive, &header)) {
-                start_pos = pos + 1;
-                file_corrupted = 1;
+            if (!should_extract) {
+                // 不需要提取，跳过数据块和CRC
+                if (header.section_size > 0) {
+                    archive_seek(header.section_size + CRC32_SIZE, SEEK_CUR);
+                }
+                else {
+                    archive_seek(CRC32_SIZE, SEEK_CUR);
+                }
+                start_pos = archive_tell();
                 continue;
             }
 
-            // 验证块头
-            long long current_pos = _ftelli64(archive) - sizeof(BlockHeader);
-            validate_block_header(&header, current_pos, current_pos, &block_num);
+            // 需要提取这个文件
+            if (file_index >= 0 && extracting_files[file_index].outfile == NULL) {
+                total_file_in_archive++;
+                // 第一次遇到这个文件，打开输出文件
+                char output_file_path[MAX_PATH];
+                build_output_path(g_output_path, header.filename, output_file_path, sizeof(output_file_path));
 
-            if (header.data_offset != write_pos) {
-                printf("Warning: File '%s' section id %llu data offset mismatch: expected 0x%llx, found 0x%llx\n",
-                    file_info[i].filename, (unsigned long long)header.section_id,
-                    (unsigned long long)header.data_offset, (unsigned long long)write_pos);
-                file_corrupted = 1;
-                if (header.data_offset < header.total_size) {
-                    printf("Seeking to expected offset...\n");
-                    if (_fseeki64(outfile, header.data_offset, SEEK_SET) != 0) {
-                        printf("Seek failed, error code: %d\n", errno);
-                    }
+                printf("Extracting: %s", header.filename);
+                if (header.flags & FLAG_ENCRYPTED) printf(" (encrypted)");
+                if (header.flags & FLAG_COMPRESSED) printf(" (compressed)");
+                printf("\n");
+
+                // 创建文件所在的目录
+                char* dir_path = strdup(output_file_path);
+                char* dir = dirname(dir_path);
+                if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
+                    create_directories(dir);
                 }
-            }
+                free(dir_path);
 
-            uint32_t original_len = header.original_size;
-            uint32_t data_len = header.section_size;
-
-            // 处理数据（如果有）
-            if (data_len > 0) {
-                // 计算CRC
-                CRC32_Context ctx;
-                crc32_init(&ctx);
-
-                // 读取数据
-                uint8_t* data_buffer = (uint8_t*)malloc(data_len);
-                if (!data_buffer) {
-                    printf("Error: Out of memory\n");
-                    fclose(outfile);
-                    fclose(archive);
-                    free(file_info);
+                // 打开输出文件
+                extracting_files[file_index].outfile = fopen(output_file_path, "wb");
+                if (!extracting_files[file_index].outfile) {
+                    printf("Error: Cannot create file %s\n", output_file_path);
+                    cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
                     return -1;
                 }
 
-                size_t actual_read = fread(data_buffer, 1, data_len, archive);
-                if (data_len - actual_read > 0) {
-                    printf("Warning: Short read for %s\n", file_info[i].filename);
-                    memset(data_buffer + actual_read, 0, data_len - actual_read);
-                }
-                long long block_start = _ftelli64(archive) - actual_read;
+                extracting_files[file_index].expected_size = header.total_size;
+                extracting_files[file_index].current_size = 0;
+                extracting_files[file_index].expected_section_id = 0;
+                extracting_files[file_index].total_sections = header.total_section_count;
+                extracting_files[file_index].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
+                extracting_files[file_index].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
+                extracting_files[file_index].corrupted = 0;
 
-                // 更新CRC
-                crc32_update(&ctx, data_buffer, data_len);
+                // 初始化进度显示
+                progress_init(&extracting_files[file_index].progress,
+                    header.total_size,
+                    header.total_section_count,
+                    header.filename);
+            }
 
-                // 如果需要解密
-                if (g_encryption_enabled && (header.flags & FLAG_ENCRYPTED)) {
-                    if (data_len % AES_BLOCK_SIZE != 0) {
-                        printf("Warning: Section size is not a multiple of AES_BLOCK_SIZE\n");
-                    }
-                    process_data_block(data_buffer, data_len, header.header_crc32, 0);
-                    if (pkcs7_unpad(data_buffer, data_len, &data_len) < 0) {
-                        printf("Error: PKCS#7 unpad failed\n");
-                        file_corrupted = 1;
-                    }
-                }
+            if (file_index >= 0 && extracting_files[file_index].outfile) {
+                // 处理这个块的数据
+                ExtractingFile* ef = &extracting_files[file_index];
 
-                // 如果需要解压缩
-                uint8_t* final_data = data_buffer;
-                uint32_t final_len = data_len;
-
-                if (header.flags & FLAG_COMPRESSED) {
-                    uint8_t* decompressed = decompress_zstd(data_buffer, data_len, original_len);
-                    if (decompressed) {
-                        final_data = decompressed;
-                        final_len = original_len;
-                        free(data_buffer);  // 释放压缩数据
-                    }
-                    else {
-                        printf("Error: Decompression failed for %s section id %llu\n",
-                            file_info[i].filename, (unsigned long long)header.section_id);
-                        file_corrupted = 1;
-                    }
+                // 检查section_id
+                if (header.section_id != ef->expected_section_id) {
+                    printf("Warning: File '%s' section id mismatch: expected %llu, found %llu\n",
+                        ef->filename, ef->expected_section_id, header.section_id);
+                    ef->corrupted = 1;
                 }
 
-                // 写入文件
-                if (final_len != original_len) {
-                    file_corrupted = 1;
-                    printf("Warning: File '%s' section id %llu size mismatch: expected 0x%llx, found 0x%llx\n",
-                        file_info[i].filename, (unsigned long long)header.section_id,
-                        (unsigned long long)header.original_size, (unsigned long long)final_len);
-                    size_t write_len = final_len > original_len ? original_len : final_len;
-                    size_t actual_write = fwrite(final_data, 1, write_len, outfile);
-                    int64_t size_diff = (int64_t)original_len - (int64_t)write_len;
-                    if (actual_write != write_len) {
-                        printf("Error: Failed to write data for %s section id %llu\n",
-                         file_info[i].filename, (unsigned long long)header.section_id);
-                    }
-                    if (size_diff > 0) {
-                        printf("Seeking pass the end of file %llu bytes...\n", original_len - write_len);
-                        if (_fseeki64(outfile, original_len - write_len, SEEK_CUR) != 0) {
+                // 检查data_offset
+                if (header.data_offset != ef->current_size) {
+                    printf("Warning: File '%s' data offset mismatch: expected %llu, found %llu\n",
+                        ef->filename, ef->current_size, header.data_offset);
+                    ef->corrupted = 1;
+                    if (header.data_offset < header.total_size) {
+                        printf("Seeking to expected offset...\n");
+                        if (_fseeki64(ef->outfile, header.data_offset, SEEK_SET) != 0) {
                             printf("Seek failed, error code: %d\n", errno);
+                        }
+                        else {
+                            ef->current_size = header.data_offset;
                         }
                     }
                 }
-                else {
-                    if (fwrite(final_data, 1, final_len, outfile) != final_len) {
-                        printf("Error: Failed to write data for %s section id %llu\n",
-                            file_info[i].filename, (unsigned long long)header.section_id);
+
+                uint32_t original_len = header.original_size;
+                uint32_t data_len = header.section_size;
+
+                // 处理数据
+                if (data_len > 0) {
+                    // 计算CRC
+                    CRC32_Context ctx;
+                    crc32_init(&ctx);
+
+                    // 读取数据
+                    uint8_t* data_buffer = (uint8_t*)malloc(data_len);
+                    if (!data_buffer) {
+                        printf("Error: Out of memory allocating %u bytes\n", data_len);
+                        cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
+                        return -1;
                     }
+
+                    size_t actual_read = archive_read(data_buffer, data_len);
+                    if (actual_read != data_len) {
+                        printf("Error: Failed to read data for %s, expected %u bytes, got %zu\n",
+                            ef->filename, data_len, actual_read);
+                        ef->corrupted = 1;
+                        memset(data_buffer + actual_read, 0, data_len - actual_read);
+                    }
+
+                    // 更新CRC
+                    crc32_update(&ctx, data_buffer, data_len);
+
+                    // 如果需要解密
+                    if (header.flags & FLAG_ENCRYPTED) {
+                        if (g_encryption_enabled) {
+                            if (data_len % AES_BLOCK_SIZE != 0) {
+                                printf("Warning: Section size is not a multiple of AES_BLOCK_SIZE\n");
+                            }
+                            process_data_block(data_buffer, data_len, header.header_crc32, 0);
+                            uint32_t unpadded_len;
+                            if (pkcs7_unpad(data_buffer, data_len, &unpadded_len) < 0) {
+                                printf("Error: PKCS#7 unpad failed\n");
+                                ef->corrupted = 1;
+                            }
+                            else {
+                                data_len = unpadded_len;
+                            }
+                        }
+                        else {
+                            printf("Error: The file is encrypted, but no password provided\n");
+                        }
+                    }
+
+                    // 如果需要解压缩
+                    uint8_t* final_data = data_buffer;
+                    uint32_t final_len = data_len;
+
+                    if (header.flags & FLAG_COMPRESSED) {
+                        uint8_t* decompressed = decompress_zstd(data_buffer, data_len, original_len);
+                        if (!decompressed) {
+                            printf("Error: Decompression failed for %s section id %llu\n",
+                                ef->filename, (unsigned long long)header.section_id);
+                            ef->corrupted = 1;
+                        }
+                        else {
+                            free(data_buffer);
+                            final_data = decompressed;
+                            final_len = original_len;
+                        }
+                    }
+
+                    // 写入文件
+                    size_t write_len = final_len > original_len ? original_len : final_len;
+                    size_t actual_write = fwrite(final_data, 1, write_len, ef->outfile);
+
+                    if (actual_write != write_len) {
+                        printf("Error: Failed to write data for %s section id %llu\n",
+                            ef->filename, (unsigned long long)header.section_id);
+                        free(final_data);
+                        cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
+                        return -1;
+                    }
+
+                    // 如果写入长度小于预期，需要seek
+                    if (write_len < original_len) {
+                        printf("Seeking past the end of file %llu bytes...\n", original_len - write_len);
+                        if (_fseeki64(ef->outfile, original_len - write_len, SEEK_CUR) != 0) {
+                            printf("Seek failed, error code: %d\n", errno);
+                        }
+                    }
+
+                    free(final_data);
+
+                    // 读取存储的CRC
+                    uint32_t stored_crc;
+                    read_crc32(&stored_crc);
+
+                    // 验证CRC
+                    uint32_t crc = crc32_final(&ctx);
+                    if (crc != stored_crc) {
+                        printf("Error: File %s section id %llu CRC check failed\n",
+                            ef->filename, (unsigned long long)header.section_id);
+                        printf("       Calculated: 0x%08x, Stored: 0x%08x\n", crc, stored_crc);
+                        ef->corrupted = 1;
+                    }
+
+                    ef->current_size += original_len;
+                    ef->expected_section_id = header.section_id + 1;
+
+                    // 更新进度
+                    progress_update(&ef->progress, ef->current_size, header.section_id, 0);
+                }
+                else {
+                    // 空文件，跳过CRC
+                    uint32_t stored_crc;
+                    read_crc32(&stored_crc);
+                    if (stored_crc != 0) {
+                        printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
+                            ef->filename, stored_crc);
+                    }
+                    ef->current_size = 0;
                 }
 
-                free(final_data);
+                // 检查文件是否完成
+                if (ef->current_size >= ef->expected_size) {
+                    progress_finish(&ef->progress);
+                    fclose(ef->outfile);
+                    ef->outfile = NULL;
 
-                // 读取存储的CRC
-                uint32_t stored_crc;
-                read_crc32(archive, &stored_crc);
-
-                // 验证CRC
-                uint32_t crc = crc32_final(&ctx);
-                if (crc != stored_crc) {
-                    printf("Error: File %s section id %llu CRC check failed\n",
-                        file_info[i].filename, (unsigned long long)header.section_id);
-                    printf("       Calculated: 0x%08x, Stored: 0x%08x\n", crc, stored_crc);
-                    printf("       Corruption location: 0x%llx - 0x%llx\n",
-                        (unsigned long long)block_start,
-                        (unsigned long long)(block_start + data_len));
-                    file_corrupted = 1;
-                }
-
-                write_pos = _ftelli64(outfile);
-            }
-            else {
-                // 空文件：跳过CRC
-                uint32_t stored_crc;
-                read_crc32(archive, &stored_crc);
-                // 空文件的CRC应该是0
-                if (stored_crc != 0) {
-                    printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
-                        file_info[i].filename, stored_crc);
-                }
-            }
-
-            if (file_info[i].total_size > 0) {
-                if (file_info[i].next_desired_section_id != header.section_id) {
-                    file_corrupted = 1;
-                    printf("Warning: File '%s' corrupted, desired section id %llu, but found %llu\n",
-                        file_info[i].filename, file_info[i].next_desired_section_id, header.section_id);
-                }
-                file_info[i].next_desired_section_id = header.section_id + 1;
-                file_info[i].actual_total_size += original_len;
-
-                if (sid + 1 >= file_info[i].actual_section_count &&
-                    file_info[i].actual_total_size != file_info[i].total_size) {
-                    file_corrupted = 1;
-                    printf("Warning: File '%s' corrupted, desired total size %llu bytes, but get %llu bytes\n",
-                        file_info[i].filename, file_info[i].total_size, file_info[i].actual_total_size);
-                }
-            }
-
-            progress_update(&progress, write_pos, header.section_id, 0);
-
-            start_pos = _ftelli64(archive);
-        }
-        progress_finish(&progress);
-
-        fclose(outfile);
-
-        if (file_corrupted) {
-            corrupted_files++;
-            char new_file_name[256];
-            snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", output_file_path);
-            printf("File %s corrupted, rename to %s\n", output_file_path, new_file_name);
-            if (rename(output_file_path, new_file_name) != 0) {
-                printf("Rename to %s failed\n", new_file_name);
-            }
-        }
-        else {
-            if (file_info[i].total_size == 0) {
-                printf("Successfully extracted empty file: %s\n", output_file_path);
-            }
-            else {
-                char flags_str[32] = "";
-                if (file_info[i].is_encrypted)
-                {
-                    if (g_encryption_enabled) {
-                        strcat(flags_str, "decrypted");
+                    if (ef->corrupted) {
+                        corrupted_files++;
+                        char new_file_name[MAX_PATH];
+                        char original_path[MAX_PATH];
+                        build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
+                        snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
+                        printf("File %s corrupted, rename to %s\n", ef->filename, new_file_name);
+                        if (rename(original_path, new_file_name) != 0) {
+                            printf("File %s rename to %s failed\n", ef->filename, new_file_name);
+                        }
                     }
                     else {
-                        strcat(flags_str, "encrypted");
+                        extracted_count++;
+                        char flags_str[32] = "";
+                        if (ef->is_encrypted && g_encryption_enabled) strcat(flags_str, "decrypted");
+                        if (ef->is_compressed) {
+                            if (strlen(flags_str) > 0) strcat(flags_str, " ");
+                            strcat(flags_str, "decompressed");
+                        }
+                        if (strlen(flags_str) > 0) {
+                            printf("Successfully extracted: %s (%llu bytes) (%s)\n",
+                                ef->filename, ef->expected_size, flags_str);
+                        }
+                        else {
+                            printf("Successfully extracted: %s (%llu bytes)\n",
+                                ef->filename, ef->expected_size);
+                        }
                     }
                 }
-                if (file_info[i].is_compressed) strcat(flags_str, " decompressed");
-                printf("Successfully extracted: %s (%llu bytes)%s%s%s\n",
-                    output_file_path,
-                    (unsigned long long)write_pos,
-                    strlen(flags_str) > 0 ? " (" : "",
-                    flags_str,
-                    strlen(flags_str) > 0 ? ")" : "");
             }
+
+            start_pos = archive_tell();
         }
     }
 
-    free(file_info);
-    fclose(archive);
+    // 关闭所有可能还打开的文件，还打开说明没读取完整（文件损坏）
+    for (int i = 0; i < extracting_count; i++) {
+        ExtractingFile* ef = &extracting_files[i];
+        if (ef->outfile) {
+            fclose(ef->outfile);
+            ef->outfile = NULL;
+            char new_file_name[MAX_PATH];
+            char original_path[MAX_PATH];
+            build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
+            snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
+            
+            printf("\nFile %s was incomplete (expected %llu bytes, got %llu), rename to %s\n",
+                extracting_files[i].filename,
+                extracting_files[i].expected_size,
+                extracting_files[i].current_size, new_file_name
+                );
+            if (rename(original_path, new_file_name) != 0) {
+                printf("File %s rename to %s failed\n", ef->filename, new_file_name);
+            }
+            corrupted_files++;
+        }
 
-    if (corrupted_files > 0) {
-        printf("Warning: %d files were found corrupted during extraction\n", corrupted_files);
-        return -1;
+        if (!extract_all && !extracting_files[i].found) {
+            printf("Warning: File '%s' not found in archive\n", extracting_files[i].filename);
+            file_not_found++;
+        }
+    }
+
+    // 清理资源
+    if (extracting_files) {
+        free(extracting_files);
+    }
+    volume_read_close(&vol_ctx);
+    g_vol_read_ctx = NULL;
+
+    // 输出总结
+    printf("\nExtraction summary:\n");
+    if (!extract_all) {
+        printf("  - Requested files: %d\n", file_count);
+        printf("  - Found and extracted: %d\n", extracted_count);
+        printf("  - Not found: %d\n", file_not_found);
     }
     else {
-        printf("Extraction completed successfully\n");
-        return 0;
+        printf("  - Total file in archive: %d\n", total_file_in_archive);
+        printf("  - Total directory in archive: %d\n", total_dir_in_archive);
+        printf("  - Successfully extracted: %d\n", extracted_count);
     }
+    printf("  - Corrupted files: %d\n", corrupted_files);
+
+    if (corrupted_files > 0 || file_not_found > 0) {
+        return -1;
+    }
+
+    printf("Extraction completed successfully\n");
+    return 0;
 }
 
 // 打印使用帮助
 void print_usage(const char* progname) {
-    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption and ZSTD compression)\n");
+    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression and multi-volume support)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-p <password>] [-z <level>] <directory>   - Create archive\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] <directory>   - Create archive\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive>                  - Extract all files\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive> <files>          - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
     printf("  %s verify [-p <password>] <archive>                   - Verify archive integrity\n", progname);
     printf("\nOptions:\n");
     printf("  -o, --output <path>        Set output file/directory path\n");
-    printf("  -s, --section-size <size>   Set section size (default: 256K)\n");
-    printf("                              Supported suffixes: K (KB), M (MB), G (GB)\n");
+    printf("  -s, --section-size <size>  Set section size (default: 256K)\n");
+    printf("                              Supported suffixes: K, M, G\n");
+    printf("  -v, --volume-size <size>   Set volume size for multi-volume archives\n");
+    printf("                              Supported suffixes: K, M, G, T (e.g., 100M, 1G, 4G)\n");
+    printf("                              Use -v 0 or omit for single file archive\n");
+    printf("                              Supports up to %d volumes\n", MAX_VOLUME_NUMBER);
     printf("  -p, --password <password>   Set encryption password (AES-128 CBC)\n");
     printf("                              Password can be 16 hex bytes (32 chars) or any string\n");
     printf("  -z, --compress <level>      Set ZSTD compression level (1-22, default: 3)\n");
@@ -2141,15 +2644,25 @@ void print_usage(const char* progname) {
     printf("  - Supports empty files (0 bytes)\n");
     printf("  - ZSTD compression (configurable level)\n");
     printf("  - AES-128 CBC encryption (data only, headers remain unencrypted)\n");
+    printf("  - Multi-volume support (automatic splitting, up to %d volumes)\n", MAX_VOLUME_NUMBER);
     printf("  - Each section uses its header CRC as IV\n");
     printf("\nExamples:\n");
     printf("  %s archive myfolder\n", progname);
     printf("  %s archive -o myarchive.lxar myfolder\n", progname);
-    printf("  %s archive -s 1M -p mypassword -z 5 -o encrypted_compressed.lxar myfolder\n", progname);
+    printf("  %s archive -s 1M -v 100M -p mypassword -z 5 -o encrypted_compressed.lxar myfolder\n", progname);
+    printf("  %s archive -v 1G myfolder                    # Split into 1GB volumes\n", progname);
+    printf("  %s archive -v 4T myfolder                    # Split into 4TB volumes (large archives)\n", progname);
+    printf("  %s archive -v 0 myfolder                      # Single file archive (default)\n", progname);
     printf("  %s archive -z 0 myfolder                      # Disable compression\n", progname);
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
     printf("  %s extract -o extracted_files -p mypassword myfolder.lxar\n", progname);
     printf("  %s extract -o output_dir archive.lxar file1.txt file2.txt\n", progname);
+    printf("\nMulti-volume naming:\n");
+    printf("  Files are named as: basename.001.lxar (1-999)\n");
+    printf("                     basename.1000.lxar (1000-9999)\n");
+    printf("                     basename.10000.lxar (10000-99999)\n");
+    printf("                     basename.100000.lxar (100000 and above)\n");
+    printf("  When extracting, specify the first volume (e.g., archive.001.lxar)\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -2165,12 +2678,19 @@ int main(int argc, char* argv[]) {
         int password_index = -1;
         int output_index = -1;
         int compress_index = -1;
+        int volume_index = -1;
 
         // 检查是否有各种选项
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--section-size") == 0) {
                 if (i + 1 < argc) {
-                    g_section_size = parse_size(argv[i + 1]);
+                    g_section_size = parse_section_size(argv[i + 1]);
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--volume-size") == 0) {
+                if (i + 1 < argc) {
+                    volume_index = i + 1;
                     i++;
                 }
             }
@@ -2195,6 +2715,18 @@ int main(int argc, char* argv[]) {
             else {
                 dir_index = i;
                 break;
+            }
+        }
+
+        // 处理分卷大小
+        if (volume_index != -1) {
+            g_volume_size = parse_volume_size(argv[volume_index]);
+            if (g_volume_size > 0) {
+                printf("Multi-volume mode enabled, volume size: %llu bytes\n", (unsigned long long)g_volume_size);
+                printf("Maximum volumes supported: %d\n", MAX_VOLUME_NUMBER);
+            }
+            else {
+                printf("Single file mode (no splitting)\n");
             }
         }
 
@@ -2223,7 +2755,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char archive_name[256];
+        char archive_name[MAX_PATH_LEN];
         if (output_index != -1) {
             // 使用指定的输出文件名
             strncpy(archive_name, argv[output_index], sizeof(archive_name) - 1);
