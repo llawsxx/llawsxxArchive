@@ -24,12 +24,18 @@
     <ClCompile Include="aes.c">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="rs.c">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="crc32.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="aes.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="rs.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

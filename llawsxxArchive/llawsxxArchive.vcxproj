@@ -136,10 +136,12 @@
     <ClCompile Include="aes.c" />
     <ClCompile Include="crc32.c" />
     <ClCompile Include="main.c" />
+    <ClCompile Include="rs.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="aes.h" />
     <ClInclude Include="crc32.h" />
+    <ClInclude Include="rs.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

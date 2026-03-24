@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include "crc32.h"
 #include "aes.h"
+#include "rs.h"
 #include <windows.h>
 #include <direct.h>
 #include <zstd.h>
@@ -27,6 +28,8 @@
 #define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
 #define MIN_SECTION_SIZE (1024)            // 最小1KB
 #define MAX_SECTION_SIZE (64 * 1024 * 1024) // 最大64MB
+#define MIN_RS_GROUP_SIZE (1 * 1024 * 1024) //最小1MB
+#define MAX_RS_GROUP_SIZE (1024 * 1024 * 1024) // 最大1024MB
 
 #define DEFAULT_VOLUME_SIZE (0)            // 默认不分卷
 #define MIN_VOLUME_SIZE (4 * 1024 * 1024)  // 最小分卷大小4MB
@@ -41,6 +44,7 @@
  // 标志位定义
 #define FLAG_ENCRYPTED 0x01  // 数据已加密
 #define FLAG_COMPRESSED 0x02  // 数据已压缩 (ZSTD)
+#define FLAG_RS_REDUNDANT 0x04  // RS冗余块
 
 // 默认压缩级别
 #define DEFAULT_COMPRESSION_LEVEL 3
@@ -51,16 +55,39 @@ typedef struct {
     char filename[MAX_PATH_LEN];       // MAX_PATH_LEN Filename
     uint64_t mtime;           // 8B Modification time (UNIX timestamp)
     uint64_t total_size;      // 8B Total file size (0 for directories)
+    uint64_t block_id;        // 8B Block ID (0 for directories)
+    uint64_t block_group_id;  // 8B Block group ID (0 for directories)
     uint64_t section_id;      // 8B Section ID (starts from 0)
     uint32_t section_size;    // 4B Section size (压缩后的数据大小，0 for directories)
     uint32_t original_size;   // 4B 原始数据大小 (压缩前，用于解压缩)
     uint64_t total_section_count;   // 8B total section count (0 for directories)
     uint64_t data_offset;     // 8B 数据在原文件中的偏移量
-    uint32_t flags;           // 4B 标志位 (如: 0x01 = 加密, 0x02 = 压缩)
+    uint32_t flags;           // 4B 标志位 (如: 0x01 = 加密, 0x02 = 压缩, 0x04 = 冗余块)
     uint32_t header_crc32;    // 4B header CRC32
     // Data follows immediately for files
     // Finally 4B CRC32 for files
 } BlockHeader;
+#pragma pack(pop)
+
+// RS数据分块信息
+#pragma pack(push, 1)
+typedef struct {
+    uint64_t block_index;     // 数据分块所在的block的block_index
+    uint32_t offset;          // 相对于这个block开头的字节偏移
+    uint32_t size;            // 这个数据分块的大小
+    uint32_t crc32;           // 这个数据分块的校验值
+} RSDataChunkInfo;
+#pragma pack(pop)
+
+// RS冗余块的数据头
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t chunk_count;     // 数据分块的数量
+    uint32_t chunk_info_size; // 每个chunk info的大小
+    uint32_t data_size;       // 冗余数据的实际大小
+    // 后面跟着chunk_count个RSDataChunkInfo
+    // 最后是实际的冗余数据
+} RSBlockHeader;
 #pragma pack(pop)
 
 typedef struct {
@@ -115,11 +142,59 @@ typedef struct {
     int printed;
 } ProgressContext;
 
+typedef struct DataBlock{
+    uint64_t block_index;
+    uint8_t* data;
+    uint32_t size;
+    uint32_t capacity;
+    struct DataBlock* next;
+} DataBlock;
+
+
+typedef struct {
+    DataBlock* front,*rear;
+    uint64_t current_block_index;
+    uint32_t total_size;
+} DataGroupContext;
+
+
+typedef struct ReassembledBlock {
+    uint64_t block_index;      // 原始block索引
+    uint32_t block_offset;   //在Block数据中的偏移
+    uint32_t original_offset;   //在原数据中的偏移
+    uint32_t size;              // 重组块的实际大小
+    uint32_t crc32;
+    struct ReassembledBlock* next;
+} ReassembledBlock;
+
+
+typedef struct {
+    uint8_t* data;
+    uint32_t total_size;        // 重组数据总大小
+    uint32_t split_size;        // 分割大小
+    ReassembledBlock* block_info; // 重组块信息链表
+    uint32_t block_count;       // 重组块数量
+} ReassembledContext;
+
+// 修复块信息
+typedef struct {
+    uint64_t block_id;
+    uint64_t section_id;
+    uint64_t total_sections;
+    uint32_t block_size;
+    uint32_t section_size;
+    uint8_t* data;
+    uint8_t* payload_data;
+} RepairBlockInfo;
+
+
+
 // 全局变量
 int total_files_processed = 0;
 int total_dirs_processed = 0;
 VolumeContext* g_vol_ctx = NULL;        // 分卷写入上下文指针
 VolumeReadContext* g_vol_read_ctx = NULL; // 分卷读取上下文指针
+DataGroupContext* g_group_ctx = NULL; // 数据组上下文指针
 uint32_t g_section_size = DEFAULT_SECTION_SIZE;  // 全局section size
 uint64_t g_volume_size = DEFAULT_VOLUME_SIZE;    // 分卷大小（0表示不分卷）
 uint8_t g_encryption_key[16] = { 0 };  // AES-128密钥
@@ -131,12 +206,523 @@ char g_output_path[MAX_PATH] = { 0 }; // 输出路径
 const char* g_input_root_path = NULL;
 int g_error_count = 0;           // 错误计数
 int g_warning_count = 0;         // 警告计数
+uint64_t g_current_block_index = 0;   // 当前块索引计数器
+uint64_t g_current_block_group_index = 0;   // 当前块组索引计数器
+
+// RS冗余相关全局变量
+int g_rs_enabled = 0;                // 是否启用RS冗余
+int g_rs_data_shards = 0;            // RS数据分片数
+int g_rs_parity_shards = 0;          // RS校验分片数
+uint64_t g_rs_group_size = 256 * 1024 * 1024;
+int g_use_rs_recovery = 0;  // 是否使用RS冗余恢复
 
 // 函数声明
-size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed);
+size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int is_write_rs);
 size_t archive_read(void* ptr, size_t size);
 int archive_seek(long long offset, int origin);
 long long archive_tell(void);
+int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t group_index);
+
+// 全局块索引计数器管理
+uint64_t get_next_block_index(void) {
+    return g_current_block_index++;
+}
+
+DataGroupContext* init_data_group_context() {
+    DataGroupContext* context = (DataGroupContext*)malloc(sizeof(DataGroupContext));
+    if (context == NULL) {
+        return NULL;
+    }
+    context->front = NULL;
+    context->rear = NULL;
+    context->total_size = 0;
+    context->current_block_index = 0;
+    return context;
+}
+
+DataBlock* create_data_block(uint64_t block_index, uint32_t capacity) {
+    DataBlock* block = (DataBlock*)malloc(sizeof(DataBlock));
+    if (block == NULL) {
+        return NULL;
+    }
+
+    block->block_index = block_index;
+    block->size = 0;  // 初始没有数据
+    block->capacity = capacity;
+    block->next = NULL;
+
+    // 预分配空间
+    if (capacity > 0) {
+        block->data = (uint8_t*)malloc(capacity);
+        if (block->data == NULL) {
+            free(block);
+            return NULL;
+        }
+        memset(block->data, 0, capacity);  // 初始化为0
+    }
+    else {
+        block->data = NULL;
+    }
+
+    return block;
+}
+
+DataBlock* find_data_block(DataGroupContext* context, uint64_t block_index) {
+    if (context == NULL || context->front == NULL) {
+        return NULL;
+    }
+    if (context->rear->block_index == block_index) return context->rear;
+
+    DataBlock* current = context->front;
+    while (current != NULL) {
+        if (current->block_index == block_index) {
+            return current;
+        }
+        current = current->next;
+    }
+
+    return NULL;
+}
+
+
+int alloc_data_block(DataGroupContext* context, uint64_t block_index, uint32_t capacity) {
+    if (context == NULL) {
+        return -1;
+    }
+
+    // 检查是否已存在
+    DataBlock* existing = find_data_block(context, block_index);
+    if (existing != NULL) {
+        return -2;
+    }
+
+    DataBlock* new_block = create_data_block(block_index, capacity);
+    if (new_block == NULL) {
+        return -1;
+    }
+
+    // 空链表
+    if (context->front == NULL) {
+        context->front = context->rear = new_block;
+        return 0;
+    }
+
+    // 快速路径：通常 block_index 应该 >= rear->block_index，直接追加到尾部
+    if (block_index >= context->rear->block_index) {
+        context->rear->next = new_block;
+        context->rear = new_block;
+        return 0;
+    }
+
+    // 慢速路径：插入到中间或最前
+    if (block_index < context->front->block_index) {
+        new_block->next = context->front;
+        context->front = new_block;
+        return 0;
+    }
+
+    DataBlock* prev = context->front;
+    DataBlock* cur = context->front->next;
+
+    while (cur != NULL && cur->block_index < block_index) {
+        prev = cur;
+        cur = cur->next;
+    }
+
+    new_block->next = cur;
+    prev->next = new_block;
+
+    return 0;
+}
+
+
+int write_to_data_block(DataGroupContext* context, uint64_t block_index,
+    const uint8_t* data, uint32_t data_size) {
+    if (context == NULL || data == NULL || data_size == 0) {
+        return -1;
+    }
+
+    DataBlock* block = find_data_block(context, block_index);
+    if (block == NULL) {
+        return -2;  // 数据块不存在
+    }
+
+    // 检查容量
+    if (block->size + data_size > block->capacity) {
+        return -3;  // 容量不足
+    }
+
+    // 追加数据
+    memcpy(block->data + block->size, data, data_size);
+    block->size += data_size;
+    context->total_size += data_size;
+
+    return 0;
+}
+
+int expand_data_block(DataGroupContext* context, uint64_t block_index, uint32_t new_capacity) {
+    DataBlock* block = find_data_block(context, block_index);
+    if (block == NULL) {
+        return -1;
+    }
+
+    if (new_capacity <= block->capacity) {
+        return -2;  // 新容量不大于当前容量
+    }
+
+    uint8_t* new_data = (uint8_t*)realloc(block->data, new_capacity);
+    if (new_data == NULL) {
+        return -3;  // 内存分配失败
+    }
+
+    block->data = new_data;
+    // 初始化新增部分为0
+    memset(block->data + block->capacity, 0, new_capacity - block->capacity);
+    block->capacity = new_capacity;
+
+    return 0;
+}
+
+int init_data_block(DataGroupContext* context, uint64_t block_index, uint32_t capacity) {
+    context->current_block_index = block_index;
+    DataBlock* block = find_data_block(context, block_index);
+    if (block == NULL) {
+        // 不存在，创建新块
+        return alloc_data_block(context, block_index, capacity);
+    }
+    else {
+        // 存在但容量不足，扩展容量
+        if (capacity > block->capacity) {
+            return expand_data_block(context, block_index, capacity);
+        }
+    }
+    return 0;
+}
+
+
+void print_data_group_context(DataGroupContext* context) {
+    if (context == NULL) {
+        printf("Context is NULL\n");
+        return;
+    }
+
+    printf("DataGroupContext: total_size = %u\n", context->total_size);
+    printf("DataBlocks:\n");
+
+    DataBlock* current = context->front;
+    int index = 0;
+    while (current != NULL) {
+        printf("  Block[%d]: index=%llu, size=%u/%u, data=",
+            index++, (unsigned long long)current->block_index,
+            current->size, current->capacity);
+
+        if (current->data != NULL && current->size > 0) {
+            int print_len = current->size < 32 ? current->size : 32;
+            for (int i = 0; i < print_len; i++) {
+                printf("%02X ", current->data[i]);
+            }
+            if (current->size > 32) {
+                printf("...");
+            }
+        }
+        else {
+            printf("(empty)");
+        }
+        printf("\n");
+        current = current->next;
+    }
+}
+
+uint8_t* get_data_block_data(DataGroupContext* context, uint64_t block_index) {
+    DataBlock* block = find_data_block(context, block_index);
+    if (block == NULL) {
+        return NULL;
+    }
+    return block->data;
+}
+
+uint32_t get_data_block_size(DataGroupContext* context, uint64_t block_index) {
+    DataBlock* block = find_data_block(context, block_index);
+    if (block == NULL) {
+        return 0;
+    }
+    return block->size;
+}
+
+void free_data_group_context(DataGroupContext* context) {
+    if (context == NULL) {
+        return;
+    }
+
+    DataBlock* current = context->front;
+    while (current != NULL) {
+        DataBlock* next = current->next;
+        if (current->data != NULL) {
+            free(current->data);
+        }
+        free(current);
+        current = next;
+    }
+
+    free(context);
+}
+
+void reset_data_group_context(DataGroupContext* context) {
+    if (context == NULL) {
+        return;
+    }
+
+    DataBlock* current = context->front;
+    while (current != NULL) {
+        DataBlock* next = current->next;
+        if (current->data != NULL) {
+            free(current->data);
+        }
+        free(current);
+        current = next;
+    }
+
+    context->front = context->rear = NULL;
+    context->total_size = 0;
+    context->current_block_index = 0;
+}
+
+
+ReassembledBlock* create_reassembled_block(uint64_t block_index, uint32_t block_offset, uint32_t original_offset, uint32_t size, uint32_t crc32) {
+    ReassembledBlock* block = (ReassembledBlock*)malloc(sizeof(ReassembledBlock));
+    if (block == NULL) {
+        return NULL;
+    }
+    block->block_index = block_index;
+    block->block_offset = block_offset;
+    block->original_offset = original_offset;
+    block->size = size;
+    block->crc32 = crc32;
+    block->next = NULL;
+    return block;
+}
+
+void add_reassembled_block_info(ReassembledContext* ctx, uint64_t block_index, uint32_t block_offset,
+    uint32_t original_offset, uint32_t size, uint32_t crc32) {
+    if (ctx == NULL) return;
+
+    ReassembledBlock* new_block = create_reassembled_block(block_index, block_offset, original_offset, size, crc32);
+    if (new_block == NULL) return;
+
+    if (ctx->block_info == NULL) {
+        ctx->block_info = new_block;
+    }
+    else {
+        ReassembledBlock* current = ctx->block_info;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = new_block;
+    }
+    ctx->block_count++;
+}
+
+ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t split_size) {
+    if (context == NULL || context->front == NULL || split_size == 0) {
+        return NULL;
+    }
+
+    // 计算总数据大小
+    uint32_t total_data_size = context->total_size;
+    if (total_data_size == 0) {
+        return NULL;
+    }
+
+    // 分配重组后的数据缓冲区
+    uint8_t* reassembled_data = (uint8_t*)malloc(total_data_size);
+    if (reassembled_data == NULL) {
+        return NULL;
+    }
+
+    // 创建重组上下文
+    ReassembledContext* result = (ReassembledContext*)malloc(sizeof(ReassembledContext));
+    if (result == NULL) {
+        free(reassembled_data);
+        return NULL;
+    }
+
+    memset(result, 0, sizeof(ReassembledContext));
+    result->data = reassembled_data;
+    result->total_size = total_data_size;
+    result->split_size = split_size;
+    result->block_info = NULL;
+    result->block_count = 0;
+
+    // 第一步：按顺序拷贝所有数据到重组缓冲区
+    uint32_t current_offset = 0;
+    DataBlock* current_block = context->front;
+
+    while (current_block != NULL && current_block->size > 0) {
+        if (current_block->data != NULL) {
+            memcpy(reassembled_data + current_offset, current_block->data, current_block->size);
+            current_offset += current_block->size;
+        }
+        current_block = current_block->next;
+    }
+
+    // 第二步：构建原始块在重组缓冲区中的位置映射
+    typedef struct {
+        uint64_t block_index;
+        uint32_t reassembled_offset;  // 在重组缓冲区中的起始偏移
+        uint32_t size;                 // 块大小
+    } BlockMapping;
+
+    // 统计有效块数量
+    uint32_t block_count = 0;
+    current_block = context->front;
+    while (current_block != NULL) {
+        if (current_block->size > 0) {
+            block_count++;
+        }
+        current_block = current_block->next;
+    }
+
+    // 分配映射数组
+    BlockMapping* mappings = (BlockMapping*)malloc(sizeof(BlockMapping) * block_count);
+    if (mappings == NULL) {
+        free(reassembled_data);
+        free(result);
+        return NULL;
+    }
+
+    // 填充映射信息
+    uint32_t mapping_idx = 0;
+    uint32_t offset = 0;
+    current_block = context->front;
+    while (current_block != NULL) {
+        if (current_block->size > 0) {
+            mappings[mapping_idx].block_index = current_block->block_index;
+            mappings[mapping_idx].reassembled_offset = offset;
+            mappings[mapping_idx].size = current_block->size;
+            mapping_idx++;
+            offset += current_block->size;
+        }
+        current_block = current_block->next;
+    }
+
+    // 第三步：按照分割大小创建重组块，并记录每个重组块对应的原始块信息
+    uint32_t reassembled_offset = 0;
+    uint32_t remaining_data = total_data_size;
+
+    while (remaining_data > 0) {
+        uint32_t current_split_size = (remaining_data > split_size) ? split_size : remaining_data;
+
+        // 计算当前重组块在重组缓冲区中的范围
+        uint32_t segment_start = reassembled_offset;
+        uint32_t segment_end = reassembled_offset + current_split_size - 1;
+
+        // 遍历所有原始块，找出与当前重组块有重叠的原始块
+        for (uint32_t i = 0; i < block_count; i++) {
+            uint32_t block_start = mappings[i].reassembled_offset;
+            uint32_t block_end = mappings[i].reassembled_offset + mappings[i].size - 1;
+
+            // 检查是否有重叠
+            if (segment_start >= block_start && segment_start <= block_end) {
+                // 计算在原始块中的偏移
+                uint32_t block_offset = segment_start - block_start;
+
+                uint32_t crc32 = crc32_calc(reassembled_data + segment_start, current_split_size);
+                // 记录重组块信息
+                add_reassembled_block_info(result, mappings[i].block_index, block_offset,
+                    segment_start, current_split_size, crc32);
+            }
+        }
+
+        reassembled_offset += current_split_size;
+        remaining_data -= current_split_size;
+    }
+
+    free(mappings);
+    return result;
+}
+
+// 计算切割大小（根据总大小和切割份数）
+// 返回每个切割块的大小（最后一块可能小于这个大小）
+uint32_t calculate_split_size_by_count(uint32_t total_size, uint32_t split_count) {
+    if (split_count == 0) {
+        return 0;
+    }
+
+    // 计算基础切割大小
+    uint32_t base_size = (total_size + split_count - 1) / split_count;
+    return base_size;
+}
+
+
+ReassembledContext* reassemble_data_by_count(DataGroupContext* context, uint32_t split_count) {
+    if (context == NULL || context->front == NULL || split_count == 0) {
+        return NULL;
+    }
+
+    // 计算总数据大小
+    uint32_t total_data_size = context->total_size;
+    if (total_data_size == 0) {
+        return NULL;
+    }
+
+    // 根据总大小和切割份数计算切割大小
+    uint32_t split_size = calculate_split_size_by_count(total_data_size, split_count);
+
+    // 调用按大小切割的函数
+    return reassemble_data_by_size(context, split_size);
+}
+
+// 打印详细重组信息
+void print_reassembled_info(ReassembledContext* ctx) {
+    if (ctx == NULL) {
+        printf("Detailed reassembled context is NULL\n");
+        return;
+    }
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════╗\n");
+    printf("║                        Reassembled Data Info                      ║\n");
+    printf("╠══════════════════════════════════════════════════════════════════╣\n");
+    printf("║ Total size: %-10u bytes    Split size: %-10u bytes    ║\n",
+        ctx->total_size, ctx->split_size);
+    printf("║ Reassembled block count: %-10u                                    ║\n",
+        ctx->block_count);
+    printf("╚══════════════════════════════════════════════════════════════════╝\n");
+
+    ReassembledBlock* current = ctx->block_info;
+    int index = 0;
+    if(current != NULL) {
+        printf("\n┌── Reassembled Block[%d] ──────────────────────────────────────┐\n", index);
+        printf("├───────────────────────────────────────────────────────────────┤\n");
+        printf("│ Original Blocks:                                             │\n");
+
+        int ref_index = 0;
+        while (current != NULL) {
+            printf("│   [%d] block_index=%-8llu block offset=%-8u offset=%-8u size=%-8u    │\n",
+                ref_index, (unsigned long long)current->block_index , current->block_offset,
+                current->original_offset, current->size);
+            current = current->next;
+            ref_index++;
+        }
+    }
+}
+
+
+// 释放按块维度的信息
+void free_reassembled_info(ReassembledContext* info) {
+    if (!info) return;
+
+    ReassembledBlock* current = info->block_info;
+    while (current != NULL) {
+        ReassembledBlock* next = current->next;
+        free(current);
+        current = next;
+    }
+    free(info->data);
+    free(info);
+}
+
+
 
 // 初始化进度显示上下文
 void progress_init(ProgressContext* ctx, uint64_t total, uint64_t total_sections, const char* filename) {
@@ -306,6 +892,8 @@ void header_host_to_be(const BlockHeader* host, BlockHeader* be) {
     be->mtime = htobe64(host->mtime);
     be->total_size = htobe64(host->total_size);
     be->section_id = htobe64(host->section_id);
+    be->block_id = htobe64(host->block_id);
+    be->block_group_id = htobe64(host->block_group_id);
     be->section_size = htobe32(host->section_size);
     be->total_section_count = htobe64(host->total_section_count);
     be->data_offset = htobe64(host->data_offset);
@@ -320,6 +908,8 @@ void header_be_to_host(const BlockHeader* be, BlockHeader* host) {
     memcpy(host->filename, be->filename, MAX_PATH_LEN);
     host->mtime = be64toh(be->mtime);
     host->total_size = be64toh(be->total_size);
+    host->block_id = be64toh(be->block_id);
+    host->block_group_id = be64toh(be->block_group_id);
     host->section_id = be64toh(be->section_id);
     host->section_size = be32toh(be->section_size);
     host->total_section_count = be64toh(be->total_section_count);
@@ -329,13 +919,48 @@ void header_be_to_host(const BlockHeader* be, BlockHeader* host) {
     host->original_size = be32toh(be->original_size);
 }
 
-size_t volume_write(VolumeContext* vol, const void* ptr, size_t size,int next_volume_if_needed);
+// 将主机字节序的RSDataChunkInfo转换为大端字节序（用于写入）
+void rs_data_chunk_info_host_to_be(const RSDataChunkInfo* host, RSDataChunkInfo* be) {
+    be->block_index = htobe64(host->block_index);
+    be->offset = htobe32(host->offset);
+    be->size = htobe32(host->size);
+    be->crc32 = htobe32(host->crc32);
+}
+
+// 将大端字节序的RSDataChunkInfo转换为主机字节序（用于读取）
+void rs_data_chunk_info_be_to_host(const RSDataChunkInfo* be, RSDataChunkInfo* host) {
+    host->block_index = be64toh(be->block_index);
+    host->offset = be32toh(be->offset);
+    host->size = be32toh(be->size);
+    host->crc32 = be32toh(be->crc32);
+}
+
+// 将主机字节序的RSBlockHeader转换为大端字节序（用于写入）
+void rs_block_header_host_to_be(const RSBlockHeader* host, RSBlockHeader* be) {
+    be->chunk_count = htobe32(host->chunk_count);
+    be->chunk_info_size = htobe32(host->chunk_info_size);
+    be->data_size = htobe32(host->data_size);
+}
+
+// 将大端字节序的RSBlockHeader转换为主机字节序（用于读取）
+void rs_block_header_be_to_host(const RSBlockHeader* be, RSBlockHeader* host) {
+    host->chunk_count = be32toh(be->chunk_count);
+    host->chunk_info_size = be32toh(be->chunk_info_size);
+    host->data_size = be32toh(be->data_size);
+}
+
+size_t volume_write(VolumeContext* vol, const void* ptr, size_t size, int next_volume_if_needed);
 
 // 统一的写入函数（支持分卷和普通文件）
-size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed) {
+size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int is_write_rs) {
     if (!g_vol_ctx || !g_vol_ctx->is_open) {
         printf("Error: Archive not open for writing\n");
         return 0;
+    }
+
+    if (!is_write_rs && g_rs_enabled && g_group_ctx) {
+        int ret = write_to_data_block(g_group_ctx, g_group_ctx->current_block_index, ptr, (uint32_t)size);
+        if (ret < 0) return ret;
     }
 
     if (g_vol_ctx->is_multi_volume) {
@@ -382,33 +1007,57 @@ long long archive_tell(void) {
 }
 
 // 写入CRC32（自动转换字节序）
-size_t write_crc32(uint32_t crc) {
+size_t write_crc32(uint32_t crc,int is_write_rs) {
     uint32_t crc_be = htobe32(crc);
-    return archive_write(&crc_be, sizeof(uint32_t),0);
+    size_t size = archive_write(&crc_be, sizeof(uint32_t), 0, is_write_rs);
+    if (!is_write_rs && g_rs_enabled && g_group_ctx && g_group_ctx->total_size >= g_rs_group_size) {
+        //print_data_group_context(g_group_ctx);
+        ReassembledContext* split_info = reassemble_data_by_count(g_group_ctx, g_rs_data_shards);
+        //print_reassembled_info(split_info);
+        printf("Writing RS data group %llu\n", g_current_block_group_index);
+        if (rs_group_write(split_info, g_rs_parity_shards, g_current_block_group_index) < 0) {
+            printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
+        }
+
+        free_reassembled_info(split_info);
+        reset_data_group_context(g_group_ctx);
+        g_current_block_group_index++;
+    }
+    return size;
 }
 
 // 读取CRC32（自动转换字节序）
-int read_crc32(uint32_t* crc) {
+int read_crc32(uint32_t* crc, uint32_t* raw_data) {
     *crc = 0;
     uint32_t crc_be;
     size_t read = archive_read(&crc_be, sizeof(uint32_t));
     if (read != sizeof(uint32_t)) return 0;
     *crc = be32toh(crc_be);
+    if(raw_data)
+        *raw_data = crc_be;
     return 1;
 }
 
 // 写入整个BlockHeader（自动转换字节序）
-size_t write_block_header(BlockHeader* header) {
+size_t write_block_header(BlockHeader* header,int is_write_rs) {
     BlockHeader be_header;
+    header->block_id = get_next_block_index();
+    header->block_group_id = g_current_block_group_index;
+
+    if (!is_write_rs && g_rs_enabled && g_group_ctx) {
+        int ret = init_data_block(g_group_ctx, header->block_id, header->section_size + sizeof(BlockHeader) + CRC32_SIZE);
+        if (ret < 0) return ret;
+    }
     header_host_to_be(header, &be_header);
     uint32_t crc = crc32_calc(&be_header, sizeof(BlockHeader) - 4);
     be_header.header_crc32 = htobe32(crc);
     header->header_crc32 = crc;
-    return archive_write(&be_header, sizeof(BlockHeader),1);
+
+    return archive_write(&be_header, sizeof(BlockHeader), 1, is_write_rs);
 }
 
 // 读取整个BlockHeader（自动转换字节序）
-int read_block_header(BlockHeader* header) {
+int read_block_header(BlockHeader* header, BlockHeader* raw_header) {
     BlockHeader be_header;
     size_t read = archive_read(&be_header, sizeof(BlockHeader));
     if (read != sizeof(BlockHeader)) return 0;
@@ -421,6 +1070,9 @@ int read_block_header(BlockHeader* header) {
         return 0;
     }
     header_be_to_host(&be_header, header);
+    if (raw_header) {
+        memcpy(raw_header, &be_header, sizeof(BlockHeader));
+    }
     return 1;
 }
 
@@ -777,6 +1429,25 @@ uint32_t parse_section_size(const char* size_str) {
     return (uint32_t)size;
 }
 
+// 解析rs size参数
+uint32_t parse_rs_group_size(const char* size_str) {
+    uint64_t size = parse_size(size_str);
+
+    // 检查范围
+    if (size < MIN_RS_GROUP_SIZE) {
+        printf("Warning: RS group size too small (%llu bytes), using minimum %d bytes\n",
+            size, MIN_RS_GROUP_SIZE);
+        size = MIN_RS_GROUP_SIZE;
+    }
+    else if (size > MAX_RS_GROUP_SIZE) {
+        printf("Warning: RS group size too large (%llu bytes), using maximum %d bytes\n",
+            size, MAX_RS_GROUP_SIZE);
+        size = MAX_RS_GROUP_SIZE;
+    }
+    return (uint32_t)size;
+}
+
+
 // 解析分卷大小参数
 uint64_t parse_volume_size(const char* size_str) {
     uint64_t size = parse_size(size_str);
@@ -931,6 +1602,7 @@ void walk_directory(const char* path, void (*file_callback)(const char*), void (
         printf("Error: Error while enumerating directory %s (error: %lu)\n", path, error);
         g_error_count++;
     }
+
     FindClose(hFind);
 }
 
@@ -1279,14 +1951,14 @@ void process_directory(const char* dirpath) {
     header.original_size = 0;
 
     // 写入块头
-    if (write_block_header(&header) != sizeof(BlockHeader)) {
+    if (write_block_header(&header,0) != sizeof(BlockHeader)) {
         printf("Error: Failed to write directory header for %s\n", relative_path);
         g_error_count++;
         return;
     }
 
     // 目录没有数据块，直接写入CRC32（全0）
-    if (write_crc32(0) != sizeof(uint32_t)) {
+    if (write_crc32(0,0) != sizeof(uint32_t)) {
         printf("Error: Failed to write CRC for directory %s\n", relative_path);
         g_error_count++;
         return;
@@ -1344,7 +2016,7 @@ void process_file(const char* filepath) {
         header.original_size = 0;
 
         // 写入块头
-        if (write_block_header(&header) != sizeof(BlockHeader)) {
+        if (write_block_header(&header,0) != sizeof(BlockHeader)) {
             printf("Error: Failed to write file header for %s\n", relative_path);
             fclose(infile);
             g_error_count++;
@@ -1352,7 +2024,7 @@ void process_file(const char* filepath) {
         }
 
         // 空文件没有数据，直接写入CRC32（全0）
-        if (write_crc32(0) != sizeof(uint32_t)) {
+        if (write_crc32(0, 0) != sizeof(uint32_t)) {
             printf("Error: Failed to write CRC for empty file %s\n", relative_path);
             fclose(infile);
             g_error_count++;
@@ -1471,7 +2143,7 @@ void process_file(const char* filepath) {
             header.original_size = original_len;  // 保存原始大小用于解压缩
 
             // 写入块头
-            if (write_block_header(&header) != sizeof(BlockHeader)) {
+            if (write_block_header(&header,0) != sizeof(BlockHeader)) {
                 printf("Error: Failed to write file header for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1493,7 +2165,7 @@ void process_file(const char* filepath) {
             crc32_update(&ctx, data_to_write, data_to_write_len);
 
             // 写入数据
-            if (archive_write(data_to_write, data_to_write_len,0) != data_to_write_len) {
+            if (archive_write(data_to_write, data_to_write_len, 0, 0) != data_to_write_len) {
                 printf("Error: Failed to write data for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1505,7 +2177,7 @@ void process_file(const char* filepath) {
             uint32_t crc = crc32_final(&ctx);
 
             // 写入CRC32
-            if (write_crc32(crc) != sizeof(uint32_t)) {
+            if (write_crc32(crc, 0) != sizeof(uint32_t)) {
                 printf("Error: Failed to write CRC for %s section id %llu\n",
                     relative_path, (unsigned long long)section_id);
                 free(data_to_write);
@@ -1540,19 +2212,28 @@ void process_file(const char* filepath) {
 
 // 创建归档文件（支持分卷）
 int create_archive(const char* archive_name, const char* input_path) {
+    if(g_rs_enabled)
+        fec_init();
+    int ret = 0;
     // 检查输入路径是否存在
     if (!is_directory(input_path)) {
         printf("Error: Input path does not exist: %s\n", input_path);
-        return -1;
+        ret = -1;
+        goto end;
     }
 
     VolumeContext vol_ctx;
     g_vol_ctx = &vol_ctx;  // 设置全局分卷写入上下文指针
-
+    g_group_ctx = init_data_group_context();
+    if (g_group_ctx == NULL) {
+        ret = -1;
+        goto end;
+    }
     // 初始化分卷
     if (volume_init(&vol_ctx, archive_name, g_volume_size) != 0) {
         g_vol_ctx = NULL;
-        return -1;
+        ret = -1;
+        goto end;
     }
 
     // 重置计数器和错误标志
@@ -1600,6 +2281,19 @@ int create_archive(const char* archive_name, const char* input_path) {
     // Windows下使用自定义目录遍历，先处理目录，再处理文件
     walk_directory(input_path, process_file, process_directory);
 
+    if (g_rs_enabled && g_group_ctx && g_group_ctx->total_size > 0) {
+        //print_data_group_context(g_group_ctx);
+        ReassembledContext* split_info = reassemble_data_by_count(g_group_ctx, g_rs_data_shards);
+        //print_reassembled_info(split_info);
+        printf("Writing RS data group %llu\n", g_current_block_group_index);
+        if (rs_group_write(split_info, g_rs_parity_shards, g_current_block_group_index) < 0) {
+            printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
+        }
+        free_reassembled_info(split_info);
+        reset_data_group_context(g_group_ctx);
+        g_current_block_group_index++;
+    }
+
     // 关闭文件
     volume_close(&vol_ctx);
     g_vol_ctx = NULL;
@@ -1625,12 +2319,18 @@ int create_archive(const char* archive_name, const char* input_path) {
     if (g_error_count > 0) {
         printf("  - Errors: %d\n", g_error_count);
         printf("Archive created with errors! Some files may be missing or corrupted.\n");
-        return -1;
+        ret = -1;
+        goto end;
     }
     else {
         printf("Archive created successfully.\n");
-        return 0;
     }
+end:
+    if (g_group_ctx) {
+        free_data_group_context(g_group_ctx);
+        g_group_ctx = NULL;
+    }
+    return ret;
 }
 
 // 列出归档内容（支持分卷）
@@ -1687,7 +2387,7 @@ int list_archive(const char* archive_name) {
             continue;
         }
 
-        if (!read_block_header(&header)) {
+        if (!read_block_header(&header,NULL)) {
             // 头损坏的情况
             printf("%-30s %-20s %-10s %-10s %-12s %s\n",
                 "[CORRUPTED BLOCK]", "", "ERROR", "", "", "HEADER CRC FAILED");
@@ -1708,11 +2408,11 @@ int list_archive(const char* archive_name) {
         if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
             // 普通文件：跳过数据块后读CRC
             archive_seek(header.section_size, SEEK_CUR);
-            read_crc32(&stored_crc);
+            read_crc32(&stored_crc,NULL);
         }
         else {
             // 目录或空文件：直接读CRC（位于头之后）
-            read_crc32(&stored_crc);
+            read_crc32(&stored_crc,NULL);
         }
 
         // 格式化时间
@@ -1747,12 +2447,13 @@ int list_archive(const char* archive_name) {
                 // 新文件，添加到列表并显示
                 if (displayed_count >= displayed_capacity) {
                     displayed_capacity = displayed_capacity ? displayed_capacity * 2 : 16;
-                    displayed_files = (DisplayedFile*)realloc(displayed_files,
+                    DisplayedFile* tmp = (DisplayedFile*)realloc(displayed_files,
                         displayed_capacity * sizeof(DisplayedFile));
-                    if (!displayed_files) {
+                    if (!tmp) {
                         printf("Error: Out of memory\n");
                         break;
                     }
+                    displayed_files = tmp;
                 }
 
                 strcpy(displayed_files[displayed_count].filename, header.filename);
@@ -1816,7 +2517,6 @@ int verify_archive(const char* archive_name) {
     typedef struct {
         char filename[MAX_PATH_LEN];
         uint64_t total_sections;
-        uint64_t found_sections;
         uint64_t first_section_id_found;
         uint64_t last_section_id_found;
         int has_section0;
@@ -1853,7 +2553,7 @@ int verify_archive(const char* archive_name) {
             continue;
         }
 
-        if (!read_block_header(&header)) {
+        if (!read_block_header(&header,NULL)) {
             start_pos = pos + 1;
             continue;
         }
@@ -1874,18 +2574,18 @@ int verify_archive(const char* archive_name) {
             // 新文件
             if (file_count >= file_capacity) {
                 file_capacity = file_capacity ? file_capacity * 2 : 16;
-                file_info = (FileVerifyInfo*)realloc(file_info,
+                FileVerifyInfo *tmp = (FileVerifyInfo*)realloc(file_info,
                     file_capacity * sizeof(FileVerifyInfo));
-                if (!file_info) {
+                if (!tmp) {
                     printf("Error: Out of memory\n");
                     break;
                 }
+                file_info = tmp;
             }
 
             file_idx = file_count++;
             strcpy(file_info[file_idx].filename, header.filename);
             file_info[file_idx].total_sections = header.total_section_count;
-            file_info[file_idx].found_sections = 0;
             file_info[file_idx].first_section_id_found = header.section_id;
             file_info[file_idx].last_section_id_found = header.section_id;
             file_info[file_idx].has_section0 = (header.section_id == 0);
@@ -1895,7 +2595,6 @@ int verify_archive(const char* archive_name) {
         }
         else if (file_idx != -1) {
             // 更新现有文件信息
-            file_info[file_idx].found_sections++;
             if (header.section_id < file_info[file_idx].first_section_id_found) {
                 file_info[file_idx].first_section_id_found = header.section_id;
             }
@@ -1914,7 +2613,7 @@ int verify_archive(const char* archive_name) {
         if (header.magic == MAGIC_NUMBER_DIR) {
             // 目录：只有CRC
             uint32_t stored_crc;
-            read_crc32(&stored_crc);
+            read_crc32(&stored_crc,NULL);
             if (stored_crc != 0) {
                 printf("%-30s %-20s %-10s %s (CRC: 0x%08x)\n",
                     header.filename, datetime_str, "<DIR>",
@@ -1930,7 +2629,7 @@ int verify_archive(const char* archive_name) {
             if (header.section_size == 0) {
                 // 空文件
                 uint32_t stored_crc;
-                read_crc32(&stored_crc);
+                read_crc32(&stored_crc,NULL);
                 if (stored_crc != 0) {
                     printf("%-30s %-20s %-10s %s (CRC: 0x%08x)\n",
                         header.filename, datetime_str, "<EMPTY>",
@@ -1983,7 +2682,7 @@ int verify_archive(const char* archive_name) {
 
                 // 读取存储的CRC
                 uint32_t stored_crc;
-                read_crc32(&stored_crc);
+                read_crc32(&stored_crc,NULL);
                 free(data_buffer);
 
                 // 显示每个section的状态
@@ -2003,9 +2702,11 @@ int verify_archive(const char* archive_name) {
                 if (header.flags & FLAG_COMPRESSED) strcat(flags_str, "compressed");
 
                 // 显示section信息
-                printf("%-30s %-20s %-10s %s (Section id %llu/%llu, Data Offset %llu, Original Size: %u,Section Size: %u, CRC: 0x%08x%s%s)\n",
+                printf("%-30s %-20s %-10s %s (Block id %llu, Group id %llu, Section id %llu/%llu, Data Offset %llu, Original Size: %u,Section Size: %u, CRC: 0x%08x%s%s)\n",
                     header.filename, datetime_str, "FILE",
                     status,
+                    (unsigned long long)header.block_id,
+                    (unsigned long long)header.block_group_id,
                     (unsigned long long)header.section_id,
                     (unsigned long long)header.total_section_count,
                     (unsigned long long)header.data_offset,
@@ -2110,26 +2811,20 @@ typedef struct {
     ProgressContext progress;
 } ExtractingFile;
 
-
-// 提取文件（支持分卷）
-void cleanup_extracting_files(ExtractingFile* files, int count, VolumeReadContext* ctx) {
-    if (files) {
-        for (int i = 0; i < count; i++) {
-            if (files[i].outfile) {
-                fclose(files[i].outfile);
-                files[i].outfile = NULL;
-            }
-        }
-        free(files);
-    }
-    if (ctx) {
-        volume_read_close(ctx);
-    }
-    g_vol_read_ctx = NULL;
-}
-
 int extract_archive(const char* archive_name, char** files, int file_count) {
     VolumeReadContext vol_ctx;
+    int ret = 0;  // 统一返回值
+
+    // 用于统计
+    int extracted_count = 0;
+    int corrupted_files = 0;
+    int file_not_found = 0;
+    int total_file_in_archive = 0;
+    int total_dir_in_archive = 0;
+
+    ExtractingFile* extracting_files = NULL;
+    int extracting_count = 0;
+    int extracting_capacity = 0;
 
     // 检查是否需要提取所有文件
     // 如果 file_count == 0，表示提取所有文件
@@ -2150,18 +2845,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
         create_directories(g_output_path);
     }
 
-    // 用于统计
-    int extracted_count = 0;
-    int corrupted_files = 0;
-    int file_not_found = 0;
-    int total_file_in_archive = 0;
-    int total_dir_in_archive = 0;
-
-    printf("\nScanning archive and extracting files...\n");
-
-    ExtractingFile* extracting_files = NULL;
-    int extracting_count = 0;
-    int extracting_capacity = 0;
+    printf("Scanning archive and extracting files...\n");
 
     // 如果不是提取所有文件，初始化提取文件列表
     if (!extract_all) {
@@ -2169,7 +2853,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
         extracting_files = (ExtractingFile*)calloc(extracting_capacity, sizeof(ExtractingFile));
         if (!extracting_files) {
             printf("Error: Out of memory\n");
-            return -1;
+            ret = -1;
+            goto cleanup;
         }
         extracting_count = file_count;
         for (int i = 0; i < file_count; i++) {
@@ -2189,8 +2874,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
     // 开始扫描归档
     if (volume_read_init(&vol_ctx, archive_name) != 0) {
-        if (extracting_files) free(extracting_files);
-        return -1;
+        ret = -1;
+        goto cleanup;
     }
     g_vol_read_ctx = &vol_ctx;
 
@@ -2217,7 +2902,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
         }
 
         // 读取块头
-        if (!read_block_header(&header)) {
+        if (!read_block_header(&header,NULL)) {
             start_pos = pos + 1;
             continue;
         }
@@ -2229,6 +2914,12 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             continue;
         }
 
+        if (header.flags & FLAG_RS_REDUNDANT) {
+            archive_seek(header.section_size + CRC32_SIZE, SEEK_CUR);
+            start_pos = archive_tell();
+            continue;
+        }
+
         // 格式化时间（用于显示）
         format_datetime(header.mtime, datetime_str, sizeof(datetime_str));
 
@@ -2237,7 +2928,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             total_dir_in_archive++;
             // 读取CRC并跳过
             uint32_t stored_crc;
-            read_crc32(&stored_crc);
+            read_crc32(&stored_crc,NULL);
 
             // 如果需要提取所有文件，创建目录
             if (extract_all) {
@@ -2265,7 +2956,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             if (!extract_all) {
                 // 检查是否需要提取这个文件
                 for (int i = 0; i < extracting_count; i++) {
-                    // 简单的子串匹配，也可以改为精确匹配
+                    // 精确匹配
                     if (strcmp(header.filename, extracting_files[i].filename) == 0) {
                         should_extract = 1;
                         file_index = i;
@@ -2293,8 +2984,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                             extracting_capacity * sizeof(ExtractingFile));
                         if (!new_files) {
                             printf("Error: Out of memory while adding new file, aborting extraction\n");
-                            cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
-                            return -1;
+                            ret = -1;
+                            goto cleanup;
                         }
                         extracting_files = new_files;
                         memset(&extracting_files[extracting_count], 0,
@@ -2355,8 +3046,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 extracting_files[file_index].outfile = fopen(output_file_path, "wb");
                 if (!extracting_files[file_index].outfile) {
                     printf("Error: Cannot create file %s\n", output_file_path);
-                    cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
-                    return -1;
+                    ret = -1;
+                    goto cleanup;
                 }
 
                 extracting_files[file_index].expected_size = header.total_size;
@@ -2391,7 +3082,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                         ef->filename, ef->current_size, header.data_offset);
                     ef->corrupted = 1;
                     if (header.data_offset < header.total_size) {
-                        printf("Seeking to expected offset...\n");
+                        printf("Seeking to expected offset\n");
                         if (_fseeki64(ef->outfile, header.data_offset, SEEK_SET) != 0) {
                             printf("Seek failed, error code: %d\n", errno);
                         }
@@ -2414,8 +3105,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                     uint8_t* data_buffer = (uint8_t*)malloc(data_len);
                     if (!data_buffer) {
                         printf("Error: Out of memory allocating %u bytes\n", data_len);
-                        cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
-                        return -1;
+                        ret = -1;
+                        goto cleanup;
                     }
 
                     size_t actual_read = archive_read(data_buffer, data_len);
@@ -2476,13 +3167,13 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                         printf("Error: Failed to write data for %s section id %llu\n",
                             ef->filename, (unsigned long long)header.section_id);
                         free(final_data);
-                        cleanup_extracting_files(extracting_files, extracting_count, &vol_ctx);
-                        return -1;
+                        ret = -1;
+                        goto cleanup;
                     }
 
                     // 如果写入长度小于预期，需要seek
                     if (write_len < original_len) {
-                        printf("Seeking past the end of file %llu bytes...\n", original_len - write_len);
+                        printf("Seeking past the end of file %llu bytes\n", original_len - write_len);
                         if (_fseeki64(ef->outfile, original_len - write_len, SEEK_CUR) != 0) {
                             printf("Seek failed, error code: %d\n", errno);
                         }
@@ -2492,7 +3183,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
                     // 读取存储的CRC
                     uint32_t stored_crc;
-                    read_crc32(&stored_crc);
+                    read_crc32(&stored_crc,NULL);
 
                     // 验证CRC
                     uint32_t crc = crc32_final(&ctx);
@@ -2512,7 +3203,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 else {
                     // 空文件，跳过CRC
                     uint32_t stored_crc;
-                    read_crc32(&stored_crc);
+                    read_crc32(&stored_crc,NULL);
                     if (stored_crc != 0) {
                         printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
                             ef->filename, stored_crc);
@@ -2561,40 +3252,44 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
         }
     }
 
+cleanup:
     // 关闭所有可能还打开的文件，还打开说明没读取完整（文件损坏）
-    for (int i = 0; i < extracting_count; i++) {
-        ExtractingFile* ef = &extracting_files[i];
-        if (ef->outfile) {
-            fclose(ef->outfile);
-            ef->outfile = NULL;
-            char new_file_name[MAX_PATH];
-            char original_path[MAX_PATH];
-            build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
-            snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
-            
-            printf("\nFile %s was incomplete (expected %llu bytes, got %llu), rename to %s\n",
-                extracting_files[i].filename,
-                extracting_files[i].expected_size,
-                extracting_files[i].current_size, new_file_name
-                );
-            if (rename(original_path, new_file_name) != 0) {
-                printf("File %s rename to %s failed\n", ef->filename, new_file_name);
-            }
-            corrupted_files++;
-        }
-
-        if (!extract_all && !extracting_files[i].found) {
-            printf("Warning: File '%s' not found in archive\n", extracting_files[i].filename);
-            file_not_found++;
-        }
-    }
-
-    // 清理资源
     if (extracting_files) {
+        for (int i = 0; i < extracting_count; i++) {
+            ExtractingFile* ef = &extracting_files[i];
+            if (ef->outfile) {
+                fclose(ef->outfile);
+                ef->outfile = NULL;
+                char new_file_name[MAX_PATH];
+                char original_path[MAX_PATH];
+                build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
+                snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
+
+                printf("\nFile %s was incomplete (expected %llu bytes, got %llu), rename to %s\n",
+                    extracting_files[i].filename,
+                    extracting_files[i].expected_size,
+                    extracting_files[i].current_size, new_file_name
+                );
+                if (rename(original_path, new_file_name) != 0) {
+                    printf("File %s rename to %s failed\n", ef->filename, new_file_name);
+                }
+                corrupted_files++;
+            }
+
+            if (!extract_all && !extracting_files[i].found) {
+                printf("Warning: File '%s' not found in archive\n", extracting_files[i].filename);
+                file_not_found++;
+            }
+        }
+
         free(extracting_files);
     }
-    volume_read_close(&vol_ctx);
-    g_vol_read_ctx = NULL;
+
+    // 清理卷读取上下文
+    if (g_vol_read_ctx) {
+        volume_read_close(&vol_ctx);
+        g_vol_read_ctx = NULL;
+    }
 
     // 输出总结
     printf("\nExtraction summary:\n");
@@ -2611,18 +3306,753 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
     printf("  - Corrupted files: %d\n", corrupted_files);
 
     if (corrupted_files > 0 || file_not_found > 0) {
+        if (ret == 0) {
+            ret = -1;
+        }
+    }
+
+    if (ret == 0) {
+        printf("Extraction completed successfully\n");
+    }
+
+    return ret;
+}
+int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t group_index) {
+    if (!ctx || ctx->data == NULL) return -1;
+
+    uint32_t max_block_size = ctx->split_size;
+    int data_shards_count = 0;
+    ReassembledBlock* current = ctx->block_info;
+
+    while (current != NULL) {
+        data_shards_count++;
+        current = current->next;
+    }
+
+    // 初始化指针
+    reed_solomon* rs = NULL;
+    uint8_t** data_shards = NULL;
+    uint8_t** parity_shards = NULL;
+    uint8_t* rs_data = NULL;
+    int ret = -1;
+
+    // 为RS编码准备数据
+    data_shards = (uint8_t**)calloc(data_shards_count, sizeof(uint8_t*));
+    parity_shards = (uint8_t**)calloc(parity_shards_count, sizeof(uint8_t*));
+
+    if (!data_shards || !parity_shards) {
+        goto cleanup;
+    }
+
+    current = ctx->block_info;
+    int i = 0;
+    while (current != NULL) {
+        data_shards[i] = (uint8_t*)calloc(max_block_size, 1);
+        if (!data_shards[i]) {
+            goto cleanup;
+        }
+        memcpy(data_shards[i], &ctx->data[current->original_offset], current->size);
+        current = current->next;
+        i++;
+    }
+
+    // 初始化校验分片
+    for (int i = 0; i < parity_shards_count; i++) {
+        parity_shards[i] = (uint8_t*)calloc(max_block_size, 1);
+        if (!parity_shards[i]) {
+            goto cleanup;
+        }
+    }
+
+    // 创建RS编码器
+    rs = reed_solomon_new(data_shards_count, parity_shards_count);
+    if (!rs) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    // 执行编码
+    int encode_result = reed_solomon_encode(rs, data_shards, parity_shards, max_block_size);
+    if (encode_result != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    // 计算并写入RS冗余块
+    uint64_t total_section_count = parity_shards_count;
+
+    for (int i = 0; i < parity_shards_count; i++) {
+        // 准备RS块头
+        BlockHeader header = { 0 };
+        header.magic = MAGIC_NUMBER_FILE;
+        snprintf(header.filename, MAX_PATH_LEN, "RS_REDUNDANT_GROUP_%llu",
+            (unsigned long long)group_index);
+        header.mtime = time(NULL);
+        header.section_id = i;
+        header.total_section_count = total_section_count;
+        header.flags = FLAG_RS_REDUNDANT;
+
+        // 准备RS块数据头
+        RSBlockHeader rs_header;
+        RSBlockHeader rs_header_be;
+        rs_header.chunk_count = ctx->block_count;
+        rs_header.chunk_info_size = sizeof(RSDataChunkInfo);
+        rs_header.data_size = max_block_size;
+
+        // 计算总数据大小
+        uint32_t total_data_size = sizeof(RSBlockHeader) +
+            data_shards_count * sizeof(RSDataChunkInfo) +
+            max_block_size;
+
+        rs_data = (uint8_t*)malloc(total_data_size);
+        if (!rs_data) {
+            ret = -1;
+            goto cleanup;
+        }
+
+        uint8_t* ptr = rs_data;
+
+        // 写入RS块头
+        rs_block_header_host_to_be(&rs_header, &rs_header_be);
+        memcpy(ptr, &rs_header_be, sizeof(RSBlockHeader));
+        ptr += sizeof(RSBlockHeader);
+
+        // 写入数据分块信息
+        current = ctx->block_info;
+        while (current != NULL) {
+            RSDataChunkInfo info;
+            RSDataChunkInfo info_be;
+            info.block_index = current->block_index;
+            info.offset = current->block_offset;
+            info.size = current->size;
+            info.crc32 = current->crc32;
+            rs_data_chunk_info_host_to_be(&info, &info_be);
+            memcpy(ptr, &info_be, sizeof(RSDataChunkInfo));
+            ptr += sizeof(RSDataChunkInfo);
+            current = current->next;
+        }
+
+        // 写入冗余数据
+        memcpy(ptr, parity_shards[i], max_block_size);
+
+        header.section_size = total_data_size;
+        header.original_size = total_data_size;
+        header.total_size = total_data_size * total_section_count;
+
+        // 写入块头
+        if (write_block_header(&header, 1) != sizeof(BlockHeader)) {
+            ret = -1;
+            goto cleanup;
+        }
+
+        // 写入数据
+        if (archive_write(rs_data, total_data_size, 0, 1) != total_data_size) {
+            ret = -1;
+            goto cleanup;
+        }
+
+        // 写入CRC
+        CRC32_Context crc_ctx;
+        crc32_init(&crc_ctx);
+        crc32_update(&crc_ctx, rs_data, total_data_size);
+        uint32_t crc = crc32_final(&crc_ctx);
+
+        free(rs_data);
+        rs_data = NULL;
+
+        if (write_crc32(crc, 1) != sizeof(uint32_t)) {
+            ret = -1;
+            goto cleanup;
+        }
+    }
+
+    ret = 0;  // 成功
+
+cleanup:
+    // 统一释放所有资源
+    if (rs) {
+        reed_solomon_release(rs);
+    }
+
+    if (rs_data) {
+        free(rs_data);
+    }
+
+    if (data_shards) {
+        for (int i = 0; i < data_shards_count; i++) {
+            if (data_shards[i]) {
+                free(data_shards[i]);
+            }
+        }
+        free(data_shards);
+    }
+
+    if (parity_shards) {
+        for (int i = 0; i < parity_shards_count; i++) {
+            if (parity_shards[i]) {
+                free(parity_shards[i]);
+            }
+        }
+        free(parity_shards);
+    }
+
+    return ret;
+}
+
+// 解析RS块信息（从内存中解析）
+int parse_rs_block_info(uint8_t* rs_data, size_t rs_size, RSDataChunkInfo** chunks,
+    int* chunk_count, uint32_t* shard_size) {
+    if (rs_size < sizeof(RSBlockHeader)) {
         return -1;
     }
 
-    printf("Extraction completed successfully\n");
+    RSBlockHeader header;
+    RSBlockHeader header_be;
+    memcpy(&header_be, rs_data, sizeof(RSBlockHeader));
+    rs_block_header_be_to_host(&header_be, &header);
+
+    if (header.chunk_info_size != sizeof(RSDataChunkInfo)) {
+        return -1;
+    }
+
+    *chunk_count = header.chunk_count;
+    *shard_size = header.data_size;
+    *chunks = (RSDataChunkInfo*)malloc(header.chunk_count * sizeof(RSDataChunkInfo));
+    if (!*chunks) {
+        return -1;
+    }
+
+    uint8_t* ptr = rs_data + sizeof(RSBlockHeader);
+    for (int i = 0; i < header.chunk_count; i++) {
+        RSDataChunkInfo info_be;
+        memcpy(&info_be, ptr, sizeof(RSDataChunkInfo));
+        rs_data_chunk_info_be_to_host(&info_be, &(*chunks)[i]);
+        ptr += sizeof(RSDataChunkInfo);
+    }
+
     return 0;
+}
+
+// 从DataGroupContext中提取数据分片和校验分片
+typedef struct {
+    uint8_t** shards;      // 数据分片数组
+    uint8_t* marks;      // 数据分片是否损坏
+    int data_shards_count;      // 数据分片数量
+    int parity_shards_count;    // 校验分片数量
+    uint32_t shard_size;        // 每个分片的大小
+    RSDataChunkInfo* chunks;    // 分片信息
+    int chunk_count;            // 分片信息数量
+} RSShardsInfo;
+
+// 释放RSShardsInfo
+void free_rs_shards_info(RSShardsInfo* rs_info) {
+    int nr_shards = rs_info->data_shards_count + rs_info->parity_shards_count;
+    if (rs_info->shards) {
+        for (int i = 0; i < nr_shards; i++) {
+            if (rs_info->shards[i]) free(rs_info->shards[i]);
+        }
+        free(rs_info->shards);
+    }
+
+    if (rs_info->marks) {
+        free(rs_info->marks);
+    }
+
+    if (rs_info->chunks) {
+        free(rs_info->chunks);
+    }
+
+    memset(rs_info, 0, sizeof(RSShardsInfo));
+}
+
+
+// 从DataGroupContext提取RS分片信息
+int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_info) {
+    if (!group_ctx || !rs_info) {
+        return -1;
+    }
+
+    memset(rs_info, 0, sizeof(RSShardsInfo));
+
+    // 第一步：扫描所有块，找出RS冗余块
+    DataBlock* current = group_ctx->front;
+    RepairBlockInfo* rs_blocks = NULL;
+    int rs_block_count = 0;
+    int rs_block_capacity = 0;
+    RepairBlockInfo* data_blocks = NULL;
+    int data_block_count = 0;
+    int data_block_capacity = 0;
+    BlockHeader header;
+    int nr_shards = 0;
+    uint8_t** shards = NULL;
+    uint8_t* marks = NULL;
+    RSDataChunkInfo* chunks = NULL;
+
+    while (current != NULL) {
+        // 解析块头（块数据的开头是BlockHeader）
+        if (current->size >= sizeof(BlockHeader)) {
+            header_be_to_host((BlockHeader*)current->data, &header);
+
+            // 检查是否是RS冗余块
+            if (header.flags & FLAG_RS_REDUNDANT) {
+                // 扩展RS块数组
+                if (rs_block_count >= rs_block_capacity) {
+                    rs_block_capacity = rs_block_capacity ? rs_block_capacity * 2 : 4;
+                    RepairBlockInfo *tmp = (RepairBlockInfo*)realloc(rs_blocks,
+                        rs_block_capacity * sizeof(RepairBlockInfo));
+                    if (!tmp) {
+                        goto cleanup;
+                    }
+                    rs_blocks = tmp;
+                }
+
+                // 记录RS块信息
+                rs_blocks[rs_block_count].block_id = header.block_id;
+                rs_blocks[rs_block_count].block_size = current->size;
+                rs_blocks[rs_block_count].section_id = header.section_id;
+                rs_blocks[rs_block_count].section_size = header.section_size;
+                rs_blocks[rs_block_count].total_sections = header.total_section_count;
+                rs_blocks[rs_block_count].data = current->data;
+                rs_blocks[rs_block_count].payload_data = current->data + sizeof(BlockHeader);
+                rs_block_count++;
+            }
+            else {
+                // 普通数据块
+                if (data_block_count >= data_block_capacity) {
+                    data_block_capacity = data_block_capacity ? data_block_capacity * 2 : 16;
+                    RepairBlockInfo* tmp = (RepairBlockInfo*)realloc(data_blocks,
+                        data_block_capacity * sizeof(RepairBlockInfo));
+                    if (!tmp) {
+                        goto cleanup;
+                    }
+                    data_blocks = tmp;
+                }
+
+                // 记录数据块信息
+                data_blocks[data_block_count].block_id = header.block_id;
+                data_blocks[data_block_count].section_id = header.section_id;
+                data_blocks[data_block_count].total_sections = header.total_section_count;
+                data_blocks[data_block_count].block_size = current->size;
+                data_blocks[data_block_count].section_size = header.section_size;
+                data_blocks[data_block_count].data = current->data;
+                data_blocks[data_block_count].payload_data = current->data + sizeof(BlockHeader);
+                data_block_count++;
+            }
+        }
+        current = current->next;
+    }
+
+    if (rs_block_count == 0) {
+        printf("No RS redundancy blocks found in this group\n");
+        goto cleanup;
+    }
+
+    // 第二步：从第一个RS块解析分片信息
+    int chunk_count = 0;
+    uint32_t shard_size = 0;
+
+    if (parse_rs_block_info(rs_blocks[0].payload_data, rs_blocks[0].section_size,
+        &chunks, &chunk_count, &shard_size) != 0) {
+        printf("Failed to parse RS block info\n");
+        goto cleanup;
+    }
+
+    // 第三步：准备分片数组
+    int data_shards_count = chunk_count;
+    uint64_t parity_shards_count = rs_blocks[0].total_sections;
+    nr_shards = data_shards_count + (int)parity_shards_count;
+
+    shards = (uint8_t**)calloc(nr_shards, sizeof(uint8_t*));
+    marks = (uint8_t*)calloc(nr_shards, sizeof(uint8_t));
+
+    if (!shards || !marks) {
+        printf("Out of memory for shard arrays\n");
+        goto cleanup;
+    }
+
+    // 初始化所有分片缓冲区
+    for (int i = 0; i < nr_shards; i++) {
+        shards[i] = (uint8_t*)calloc(shard_size, 1);
+        if (!shards[i]) {
+            printf("Out of memory for shard %d\n", i);
+            goto cleanup;
+        }
+    }
+
+    for (int i = 0; i < nr_shards; i++) {
+        marks[i] = 1;
+    }
+
+    // 第四步：从数据块中填充数据分片
+    for (int i = 0; i < chunk_count; i++) {
+        for (int j = 0; j < data_block_count; j++) {
+            RepairBlockInfo* block = &data_blocks[j];
+            if (chunks[i].block_index == block->block_id) {
+                uint32_t remaining = chunks[i].size;
+                uint32_t offset = chunks[i].offset;
+                uint32_t shard_offset = 0;
+                int j2 = j;
+                while (remaining > 0 && j2 < data_block_count) {
+                    block = &data_blocks[j2];
+                    uint32_t read_size = remaining > block->block_size - offset ? block->block_size - offset : remaining;
+                    memcpy(shards[i] + shard_offset, block->data + offset, read_size);
+                    remaining -= read_size;
+                    shard_offset += read_size;
+                    j2++;
+                    offset = 0;
+                }
+                uint32_t crc32 = crc32_calc(shards[i], chunks[i].size);
+                if (crc32 == chunks[i].crc32) {
+                    marks[i] = 0;
+                }
+                break;
+            }
+        }
+    }
+
+    // 第五步：从RS块中填充校验分片
+    for (int i = 0; i < rs_block_count; i++) {
+        RepairBlockInfo* rs_block = &rs_blocks[i];
+        if (rs_block->section_id >= parity_shards_count) {
+            printf("  Warning: invalid RS section_id %llu\n", rs_block->section_id);
+            continue;
+        }
+        // 提取校验数据（跳过RS块头和数据分片信息）
+        uint8_t* rs_data_start = rs_block->payload_data + sizeof(RSBlockHeader) +
+            chunk_count * sizeof(RSDataChunkInfo);
+        uint32_t rs_data_size = rs_block->section_size - (sizeof(RSBlockHeader) +
+            chunk_count * sizeof(RSDataChunkInfo));
+
+        if (rs_data_size >= shard_size) {
+            memcpy(shards[(int)rs_block->section_id + data_shards_count], rs_data_start, shard_size);
+            marks[(int)rs_block->section_id + data_shards_count] = 0;
+        }
+        else {
+            printf("  Warning: RS block %llu has insufficient data\n", rs_block->block_id);
+        }
+    }
+
+
+    // 填充输出结构
+    rs_info->shards = shards;
+    rs_info->marks = marks;
+    rs_info->data_shards_count = data_shards_count;
+    rs_info->parity_shards_count = (int)parity_shards_count;
+    rs_info->shard_size = shard_size;
+    rs_info->chunks = chunks;
+    rs_info->chunk_count = chunk_count;
+
+    // 释放临时数组（不释放分片数据）
+    free(data_blocks);
+    free(rs_blocks);
+    return 0;
+
+cleanup:
+    if (shards) {
+        // 清理已分配的分片
+        for (int i = 0; i < nr_shards; i++) {
+            if (shards[i]) free(shards[i]);
+        }
+        free(shards);
+    }
+    if (marks) 
+        free(marks);
+    if(chunks)
+        free(chunks);
+    if(data_blocks)
+        free(data_blocks);
+    if(rs_blocks)
+        free(rs_blocks);
+    return -1;
+}
+
+// 恢复group
+int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
+    if (!group_ctx) {
+        return -1;
+    }
+    RSShardsInfo rs_info;
+    int ret = 0;
+    if (extract_rs_shards_from_group(group_ctx, &rs_info) != 0) {
+        DataBlock* current = group_ctx->front;
+        while (current != NULL) {
+            if (current->data && current->size > 0) {
+                size_t written = archive_write(current->data, current->size, 0, 0);
+                if (written != current->size) {
+                    printf("  Warning: Failed to write block id %llu (size=%u)\n",current->block_index, current->size);
+                    ret = -1;
+                }
+            }
+            current = current->next;
+        }
+        return ret;
+    }
+
+    // 创建RS解码器
+    int total_shards = rs_info.data_shards_count + rs_info.parity_shards_count;
+
+    int is_corrupted = 0;
+    for (int i = 0; i < total_shards; i++) {
+        if (rs_info.marks[i] == 1) {
+            printf("Shard index %d corrupted, data %d shards, parity %d shards\n",i, rs_info.data_shards_count, rs_info.parity_shards_count);
+            is_corrupted = 1;
+        }
+    }
+    if (is_corrupted) {
+        reed_solomon* rs = reed_solomon_new(rs_info.data_shards_count, rs_info.parity_shards_count);
+        if (rs) {
+            // 执行RS解码
+            printf("Reconstructing missing chunks\n");
+            int decode_result = reed_solomon_reconstruct(rs, rs_info.shards, rs_info.marks, total_shards, rs_info.shard_size);
+
+            if (decode_result == 0) {
+                printf("RS reconstruction successful!\n");
+            }
+            else {
+                printf("RS reconstruction failed with error code: %d\n", decode_result);
+                ret = -1;
+            }
+
+            // 清理资源
+            reed_solomon_release(rs);
+        }
+        else {
+            printf("Failed to create RS decoder\n");
+            ret = -1;
+        }
+    }
+
+    for (int i = 0; i < rs_info.data_shards_count; i++) {
+        uint32_t size = rs_info.chunks[i].size;
+        size_t written = archive_write(rs_info.shards[i], size, 0, 0);
+        if (written != size) {
+            printf("  Warning: Failed to write shards (size=%u)\n", size);
+            ret = -1;
+        }
+    }
+    free_rs_shards_info(&rs_info);
+
+    return ret;
+}
+
+
+// 修复归档的主函数
+int repair_archive(const char* archive_name, const char* repaired_archive_name) {
+    fec_init();
+    VolumeReadContext vol_read_ctx;
+    VolumeContext vol_write_ctx;
+    DataGroupContext* group_ctx = NULL;
+
+    int ret = 0;
+    printf("========================================\n");
+    printf("LXAR Archive Repair\n");
+    printf("========================================\n\n");
+
+    // 初始化读取上下文
+    if (volume_read_init(&vol_read_ctx, archive_name) != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+    g_vol_read_ctx = &vol_read_ctx;
+
+    // 用于存储所有需要修复的组
+    group_ctx = init_data_group_context();
+    if (group_ctx == NULL) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    // 初始化写入
+    if (volume_init(&vol_write_ctx, repaired_archive_name, 0) != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+    g_vol_ctx = &vol_write_ctx;
+
+    BlockHeader header,raw_header;
+    long long start_pos = 0;
+    long long pos = 0;
+    uint64_t block_num = 0;
+    int result;
+    uint64_t last_group_id = (uint64_t)-1;
+
+    long long filesize = vol_read_ctx.file_size;
+
+    printf("Scanning archive and detecting corruption...\n\n");
+
+    while (1) {
+        // 查找下一个块
+        pos = find_next_magic(vol_read_ctx.file, start_pos, filesize);
+        if (pos == -1) {
+            // 尝试下一个分卷
+            if (volume_read_next(&vol_read_ctx) != 0) {
+                break;
+            }
+            start_pos = 0;
+            filesize = vol_read_ctx.file_size;
+            continue;
+        }
+
+        // 读取块头
+        if (!read_block_header(&header,&raw_header)) {
+            printf("Warning: Failed to read block header at position %lld\n", pos);
+            start_pos = pos + 1;
+            continue;
+        }
+
+        // 验证块头
+        result = validate_block_header(&header, pos, start_pos, &block_num);
+
+        int block_available = 1;
+
+        // 检查magic number
+        if (header.magic != MAGIC_NUMBER_FILE && header.magic != MAGIC_NUMBER_DIR) {
+            printf("Warning: Invalid magic number 0x%08x at position %lld\n",
+                header.magic, pos);
+        }
+
+        // 读取数据并验证CRC
+        uint32_t stored_crc = 0;
+        uint32_t stored_raw_crc = 0;
+        uint8_t* data_buffer = NULL;
+        uint32_t data_len = header.section_size;
+
+        if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
+            // 读取数据
+            data_buffer = (uint8_t*)malloc(data_len);
+            if (data_buffer) {
+                size_t actual_read = archive_read(data_buffer, data_len);
+                if (actual_read != data_len) {
+                    printf("Warning: Short read for block %llu (expected %u, got %zu)\n",
+                        (unsigned long long)header.block_id, data_len, actual_read);
+                    if(header.flags & FLAG_RS_REDUNDANT) //冗余块不允许损坏
+                        block_available = 0;
+                }
+                else {
+                    // 计算CRC
+                    CRC32_Context crc_ctx;
+                    crc32_init(&crc_ctx);
+                    crc32_update(&crc_ctx, data_buffer, data_len);
+                    uint32_t calc_crc = crc32_final(&crc_ctx);
+
+                    // 读取存储的CRC
+                    read_crc32(&stored_crc,&stored_raw_crc);
+
+                    if (calc_crc != stored_crc) {
+                        printf("Warning: CRC mismatch for block %llu (group %llu): calc=0x%08x, stored=0x%08x\n",
+                            (unsigned long long)header.block_id,
+                            (unsigned long long)header.block_group_id,
+                            calc_crc, stored_crc);
+                        //有可能只坏了部分，重组shards的时候会再计算一次CRC，可能这个block整体数据不正确，但部分数据是正确的
+                        //所以不标记block_corrupted（但冗余块不允许损坏）
+                        if (header.flags & FLAG_RS_REDUNDANT)
+                            block_available = 0;
+                    }
+                }
+            }
+            else {
+                printf("Warning: Out of memory for block %llu\n",
+                    (unsigned long long)header.block_id);
+                block_available = 0;
+            }
+        }
+        else if (header.magic == MAGIC_NUMBER_FILE && header.section_size == 0) {
+            // 空文件，只读取CRC
+            read_crc32(&stored_crc, &stored_raw_crc);
+            if (stored_crc != 0) {
+                printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
+                    header.filename, stored_crc);
+            }
+        }
+        else if (header.magic == MAGIC_NUMBER_DIR) {
+            // 目录块，只读取CRC
+            read_crc32(&stored_crc, &stored_raw_crc);
+            if (stored_crc != 0) {
+                printf("Warning: Directory %s has non-zero CRC 0x%08x\n",
+                    header.filename, stored_crc);
+            }
+        }
+
+        if (block_available) {
+            // group_id大于0的组才会有冗余数据
+            if (header.block_group_id == 0) {
+                size_t written = write_block_header(&header, 0);
+                if (written != sizeof(BlockHeader)) {
+                    printf("  Warning: Failed to write block id %llu header\n", header.block_id);
+                }
+                if (data_buffer) {
+                    written = archive_write(data_buffer, header.section_size,0,0);
+                    if (written != header.section_size) {
+                        printf("  Warning: Failed to write block id %llu data\n", header.block_id);
+                    }
+                }
+                written = write_crc32(stored_crc, 0);
+                if (written != sizeof(uint32_t)) {
+                    printf("  Warning: Failed to write block id %llu crc32\n", header.block_id);
+                }
+            }
+            else {
+
+                if (last_group_id == (uint64_t)-1) {
+                    last_group_id = header.block_group_id;
+                }
+
+                if (header.block_group_id != last_group_id) {
+                    //print_data_group_context(group_ctx);
+                    printf("Processing group index %llu\n", last_group_id);
+                    if (recover_group_with_rs_and_write(group_ctx) < 0) {
+                        ret = -1;
+                    }
+                    reset_data_group_context(group_ctx);
+                }
+                if (init_data_block(group_ctx, header.block_id, header.section_size + sizeof(BlockHeader) + CRC32_SIZE) >= 0) {
+                    //TODO 一次写入？
+                    write_to_data_block(group_ctx, group_ctx->current_block_index, (uint8_t*)&raw_header, sizeof(BlockHeader));
+                    if (data_buffer) {
+                        write_to_data_block(group_ctx, group_ctx->current_block_index,
+                            data_buffer, header.section_size);
+                    }
+                    // 写入CRC
+                    write_to_data_block(group_ctx, group_ctx->current_block_index,
+                        (uint8_t*)&stored_raw_crc, CRC32_SIZE);
+                }
+                last_group_id = header.block_group_id;
+            }
+        }
+        if (data_buffer) {
+            free(data_buffer);
+            data_buffer = NULL;
+        }
+
+        start_pos = archive_tell();
+    }
+    if (last_group_id != (uint64_t)-1 && group_ctx->total_size > 0) {
+        printf("Processing group index %llu\n", last_group_id);
+        if (recover_group_with_rs_and_write(group_ctx) < 0) {
+            ret = -1;
+        }
+        reset_data_group_context(group_ctx);
+    }
+cleanup:
+    if (group_ctx) {
+        free_data_group_context(group_ctx);
+    }
+    if (g_vol_read_ctx) {
+        volume_read_close(g_vol_read_ctx);
+        g_vol_read_ctx = NULL;
+    }
+    if (g_vol_ctx) {
+        volume_close(g_vol_ctx);
+        g_vol_ctx = NULL;
+    }
+    return ret;
 }
 
 // 打印使用帮助
 void print_usage(const char* progname) {
-    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression and multi-volume support)\n");
+    printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression, multi-volume and RS redundancy support)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] <directory>   - Create archive\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [--rs <data> <parity>] [--rs-group-size <size>] <directory>   - Create archive\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive>                  - Extract all files\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] <archive> <files>          - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
@@ -2639,12 +4069,15 @@ void print_usage(const char* progname) {
     printf("                              Password can be 16 hex bytes (32 chars) or any string\n");
     printf("  -z, --compress <level>      Set ZSTD compression level (1-22, default: 3)\n");
     printf("                              Use -z 0 to disable compression\n");
+    printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (data + parity shards)\n");
+    printf("  --rs-group-size <size>      Set RS group size (default: 100M)\n");
     printf("\nFeatures:\n");
     printf("  - Supports empty directories\n");
     printf("  - Supports empty files (0 bytes)\n");
     printf("  - ZSTD compression (configurable level)\n");
     printf("  - AES-128 CBC encryption (data only, headers remain unencrypted)\n");
     printf("  - Multi-volume support (automatic splitting, up to %d volumes)\n", MAX_VOLUME_NUMBER);
+    printf("  - Reed-Solomon erasure coding for data recovery\n");
     printf("  - Each section uses its header CRC as IV\n");
     printf("\nExamples:\n");
     printf("  %s archive myfolder\n", progname);
@@ -2654,6 +4087,8 @@ void print_usage(const char* progname) {
     printf("  %s archive -v 4T myfolder                    # Split into 4TB volumes (large archives)\n", progname);
     printf("  %s archive -v 0 myfolder                      # Single file archive (default)\n", progname);
     printf("  %s archive -z 0 myfolder                      # Disable compression\n", progname);
+    printf("  %s archive --rs 10 3 myfolder                 # Add 3 parity blocks for every 10 data blocks\n", progname);
+    printf("  %s archive --rs 10 3 --rs-group-size 200M myfolder\n", progname);
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
     printf("  %s extract -o extracted_files -p mypassword myfolder.lxar\n", progname);
     printf("  %s extract -o output_dir archive.lxar file1.txt file2.txt\n", progname);
@@ -2679,6 +4114,9 @@ int main(int argc, char* argv[]) {
         int output_index = -1;
         int compress_index = -1;
         int volume_index = -1;
+        int rs_data = -1;
+        int rs_parity = -1;
+        int rs_group_size_index = -1;
 
         // 检查是否有各种选项
         for (int i = 2; i < argc; i++) {
@@ -2709,6 +4147,19 @@ int main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "-z") == 0 || strcmp(argv[i], "--compress") == 0) {
                 if (i + 1 < argc) {
                     compress_index = i + 1;
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "--rs") == 0) {
+                if (i + 2 < argc) {
+                    rs_data = atoi(argv[i + 1]);
+                    rs_parity = atoi(argv[i + 2]);
+                    i += 2;
+                }
+            }
+            else if (strcmp(argv[i], "--rs-group-size") == 0) {
+                if (i + 1 < argc) {
+                    rs_group_size_index = i + 1;
                     i++;
                 }
             }
@@ -2747,7 +4198,19 @@ int main(int argc, char* argv[]) {
         if (password_index != -1) {
             generate_key_from_password(argv[password_index]);
         }
+        // 冗余设置
+        if (rs_data > 0 && rs_parity > 0) {
+            g_rs_enabled = 1;
+            g_rs_data_shards = rs_data;
+            g_rs_parity_shards = rs_parity;
+            g_current_block_group_index = 1;
+            printf("RS redundancy enabled: %d data shards, %d parity shards\n", rs_data, rs_parity);
+        }
 
+        if (rs_group_size_index != -1) {
+            g_rs_group_size = parse_rs_group_size(argv[rs_group_size_index]);
+            printf("RS group size: %llu bytes\n", (unsigned long long)g_rs_group_size);
+        }
         // 找到目录参数
         if (dir_index >= argc) {
             printf("Error: Missing directory name\n");
@@ -2844,6 +4307,40 @@ int main(int argc, char* argv[]) {
         }
 
         return verify_archive(argv[archive_index]);
+    }else if (strcmp(argv[1], "repair") == 0 && argc >= 3) {
+        int archive_index = 2;
+        int output_index = -1;
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+                if (i + 1 < argc) {
+                    output_index = i + 1;
+                    i++;
+                }
+            }
+            else {
+                archive_index = i;
+                break;
+            }
+
+        }
+
+        if (archive_index >= argc) {
+            printf("Error: Missing archive name\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+
+        char repaired_archive_name[MAX_PATH_LEN];
+        if (output_index != -1) {
+            strncpy(repaired_archive_name, argv[output_index], sizeof(repaired_archive_name) - 1);
+            repaired_archive_name[sizeof(repaired_archive_name) - 1] = '\0';
+        }
+        else {
+            snprintf(repaired_archive_name, sizeof(repaired_archive_name), "%s.repaired", get_last_path_component(argv[archive_index]));
+        }
+
+        return repair_archive(argv[archive_index], repaired_archive_name);
     }
     else {
         print_usage(argv[0]);
