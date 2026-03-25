@@ -3180,7 +3180,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
                     // 如果写入长度小于预期，需要seek
                     if (write_len < original_len) {
-                        printf("Seeking past the end of file %llu bytes\n", original_len - write_len);
+                        printf("Seeking past the end of file %llu bytes\n", (unsigned long long)(original_len - write_len));
                         if (_fseeki64(ef->outfile, original_len - write_len, SEEK_CUR) != 0) {
                             printf("Seek failed, error code: %d\n", errno);
                         }
