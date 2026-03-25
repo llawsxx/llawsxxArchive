@@ -221,7 +221,7 @@ size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int
 size_t archive_read(void* ptr, size_t size);
 int archive_seek(long long offset, int origin);
 long long archive_tell(void);
-int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t group_index);
+int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards_count, uint64_t group_index,uint32_t split_count);
 
 // 全局块索引计数器管理
 uint64_t get_next_block_index(void) {
@@ -522,6 +522,10 @@ void add_reassembled_block_info(ReassembledContext* ctx, uint64_t block_index, u
     ctx->block_count++;
 }
 
+uint32_t round_up_to_multiple(uint32_t x, uint32_t multiple) {
+    return (x + multiple - 1) / multiple * multiple;
+}
+
 ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t split_size) {
     if (context == NULL || context->front == NULL || split_size == 0) {
         return NULL;
@@ -529,14 +533,20 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
 
     // 计算总数据大小
     uint32_t total_data_size = context->total_size;
+    uint32_t aligned_total_data_size = round_up_to_multiple(total_data_size, split_size);
     if (total_data_size == 0) {
         return NULL;
     }
 
-    // 分配重组后的数据缓冲区
-    uint8_t* reassembled_data = (uint8_t*)malloc(total_data_size);
+    // 分配重组后的数据缓冲区，分配aligned_total_data_size的大小，那么后面就可以直接用reassembled_data的指针组data_shards了
+    uint8_t* reassembled_data = (uint8_t*)malloc(aligned_total_data_size);
     if (reassembled_data == NULL) {
         return NULL;
+    }
+
+    //最后一段需要设0
+    if (aligned_total_data_size > total_data_size) {
+        memset(reassembled_data + total_data_size, 0, aligned_total_data_size - total_data_size);
     }
 
     // 创建重组上下文
@@ -1012,14 +1022,12 @@ size_t write_crc32(uint32_t crc,int is_write_rs) {
     size_t size = archive_write(&crc_be, sizeof(uint32_t), 0, is_write_rs);
     if (!is_write_rs && g_rs_enabled && g_group_ctx && g_group_ctx->total_size >= g_rs_group_size) {
         //print_data_group_context(g_group_ctx);
-        ReassembledContext* split_info = reassemble_data_by_count(g_group_ctx, g_rs_data_shards);
         //print_reassembled_info(split_info);
         printf("Writing RS data group %llu\n", g_current_block_group_index);
-        if (rs_group_write(split_info, g_rs_parity_shards, g_current_block_group_index) < 0) {
+        if (rs_group_reassemble_and_write(g_group_ctx, g_rs_parity_shards, g_current_block_group_index, g_rs_data_shards) < 0) {
             printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
         }
 
-        free_reassembled_info(split_info);
         reset_data_group_context(g_group_ctx);
         g_current_block_group_index++;
     }
@@ -2283,13 +2291,12 @@ int create_archive(const char* archive_name, const char* input_path) {
 
     if (g_rs_enabled && g_group_ctx && g_group_ctx->total_size > 0) {
         //print_data_group_context(g_group_ctx);
-        ReassembledContext* split_info = reassemble_data_by_count(g_group_ctx, g_rs_data_shards);
         //print_reassembled_info(split_info);
         printf("Writing RS data group %llu\n", g_current_block_group_index);
-        if (rs_group_write(split_info, g_rs_parity_shards, g_current_block_group_index) < 0) {
+        if (rs_group_reassemble_and_write(g_group_ctx, g_rs_parity_shards, g_current_block_group_index, g_rs_data_shards) < 0) {
             printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
         }
-        free_reassembled_info(split_info);
+
         reset_data_group_context(g_group_ctx);
         g_current_block_group_index++;
     }
@@ -3317,17 +3324,15 @@ cleanup:
 
     return ret;
 }
-int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t group_index) {
-    if (!ctx || ctx->data == NULL) return -1;
+int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards_count, uint64_t group_index, uint32_t split_count) {
+    if (!group_ctx || group_ctx->front == NULL) return -1;
 
-    uint32_t max_block_size = ctx->split_size;
-    int data_shards_count = 0;
-    ReassembledBlock* current = ctx->block_info;
+    ReassembledContext* split_info = reassemble_data_by_count(group_ctx, split_count);
+    if (!split_info) return -1;
 
-    while (current != NULL) {
-        data_shards_count++;
-        current = current->next;
-    }
+    uint32_t max_block_size = split_info->split_size;
+    ReassembledBlock* current = split_info->block_info;
+    int data_shards_count = split_info->block_count;
 
     // 初始化指针
     reed_solomon* rs = NULL;
@@ -3344,14 +3349,10 @@ int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t gr
         goto cleanup;
     }
 
-    current = ctx->block_info;
+    current = split_info->block_info;
     int i = 0;
     while (current != NULL) {
-        data_shards[i] = (uint8_t*)calloc(max_block_size, 1);
-        if (!data_shards[i]) {
-            goto cleanup;
-        }
-        memcpy(data_shards[i], &ctx->data[current->original_offset], current->size);
+        data_shards[i] = &split_info->data[current->original_offset];
         current = current->next;
         i++;
     }
@@ -3395,7 +3396,7 @@ int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t gr
         // 准备RS块数据头
         RSBlockHeader rs_header;
         RSBlockHeader rs_header_be;
-        rs_header.chunk_count = ctx->block_count;
+        rs_header.chunk_count = split_info->block_count;
         rs_header.chunk_info_size = sizeof(RSDataChunkInfo);
         rs_header.data_size = max_block_size;
 
@@ -3418,7 +3419,7 @@ int rs_group_write(ReassembledContext* ctx, int parity_shards_count, uint64_t gr
         ptr += sizeof(RSBlockHeader);
 
         // 写入数据分块信息
-        current = ctx->block_info;
+        current = split_info->block_info;
         while (current != NULL) {
             RSDataChunkInfo info;
             RSDataChunkInfo info_be;
@@ -3479,11 +3480,6 @@ cleanup:
     }
 
     if (data_shards) {
-        for (int i = 0; i < data_shards_count; i++) {
-            if (data_shards[i]) {
-                free(data_shards[i]);
-            }
-        }
         free(data_shards);
     }
 
@@ -3495,6 +3491,8 @@ cleanup:
         }
         free(parity_shards);
     }
+
+    free_reassembled_info(split_info);
 
     return ret;
 }
