@@ -19,7 +19,7 @@
 #include <sys/stat.h>
 #include "crc32.h"
 #include "aes.h"
-#include "rs.h"
+#include "fec.h"
 #include <windows.h>
 #include <direct.h>
 #include <zstd.h>
@@ -213,8 +213,7 @@ uint64_t g_current_block_group_index = 0;   // 当前块组索引计数器
 int g_rs_enabled = 0;                // 是否启用RS冗余
 int g_rs_data_shards = 0;            // RS数据分片数
 int g_rs_parity_shards = 0;          // RS校验分片数
-uint64_t g_rs_group_size = 256 * 1024 * 1024;
-int g_use_rs_recovery = 0;  // 是否使用RS冗余恢复
+uint64_t g_rs_group_size = 512 * 1024 * 1024;
 
 // 函数声明
 size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int is_write_rs);
@@ -3335,9 +3334,10 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
     int data_shards_count = split_info->block_count;
 
     // 初始化指针
-    reed_solomon* rs = NULL;
+    fec_t* code = NULL;
     uint8_t** data_shards = NULL;
     uint8_t** parity_shards = NULL;
+    unsigned int* blocknums = NULL;
     uint8_t* rs_data = NULL;
     int ret = -1;
 
@@ -3366,18 +3366,25 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
     }
 
     // 创建RS编码器
-    rs = reed_solomon_new(data_shards_count, parity_shards_count);
-    if (!rs) {
+    code = fec_new(data_shards_count, data_shards_count + parity_shards_count);
+    if (!code) {
         ret = -1;
         goto cleanup;
     }
 
-    // 执行编码
-    int encode_result = reed_solomon_encode(rs, data_shards, parity_shards, max_block_size);
-    if (encode_result != 0) {
+    blocknums = malloc(sizeof(size_t) * parity_shards_count);
+
+    if (!blocknums) {
         ret = -1;
         goto cleanup;
     }
+
+    for (int i = 0; i < parity_shards_count; i++) {
+        blocknums[i] = (unsigned int)(i + data_shards_count);
+    }
+
+    // 执行编码
+    fec_encode(code, data_shards, parity_shards, blocknums, parity_shards_count, max_block_size);
 
     // 计算并写入RS冗余块
     uint64_t total_section_count = parity_shards_count;
@@ -3471,8 +3478,12 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
 
 cleanup:
     // 统一释放所有资源
-    if (rs) {
-        reed_solomon_release(rs);
+    if (code) {
+        fec_free(code);
+    }
+
+    if (blocknums) {
+        free(blocknums);
     }
 
     if (rs_data) {
@@ -3764,6 +3775,79 @@ cleanup:
     return -1;
 }
 
+int fec_reconstruct(fec_t* code,
+    unsigned char** shards,
+    unsigned char* marks,
+    int block_size)
+{
+    int i;
+    int k, n;
+    int avail = 0, pn = 0, j = 0;
+    unsigned* indexes = NULL;
+    unsigned char** inpkts = NULL;
+    unsigned char** outpkts = NULL;
+    int ret = 0;
+    if (!code || !shards || !marks || block_size <= 0) {
+        return -1;
+    }
+
+    k = code->k;
+    n = code->n;
+
+
+    indexes = (unsigned*)malloc((size_t)k * sizeof(unsigned));
+    inpkts = (unsigned char**)malloc((size_t)k * sizeof(unsigned char*));
+    outpkts = (unsigned char**)malloc((size_t)(n - k) * sizeof(unsigned char*));
+    if (!indexes || !inpkts || !outpkts) {
+        ret = -1;
+        goto end;
+    }
+
+    // 收集已有块和缺失块
+    for (i = 0; i < k; i++) {
+        if (!marks[i]) {
+            inpkts[i] = shards[i];
+            indexes[i] = (unsigned int)i;
+            avail++;
+        }
+        else {
+            while(pn < n - k) {
+                if (!marks[k + pn]) {
+                    inpkts[i] = shards[k + pn];
+                    indexes[i] = (unsigned int)(k + pn);
+                    outpkts[j++] = shards[i];
+                    avail++;
+                    pn++;
+                    break;
+                }
+                else {
+                    pn++;
+                }
+            }
+        }
+    }
+
+    // zfec 的 decode 要求：至少有 k 个可用块
+    if (avail < k) {
+        ret = -1;
+        goto end;
+    }
+
+    fec_decode(code,
+        (const gf* const*)inpkts,
+        (gf* const*)outpkts,
+        indexes,
+        (size_t)block_size);
+
+end:
+    free(indexes);
+    free(inpkts);
+    free(outpkts);
+
+    return ret;
+}
+
+
 // 恢复group
 int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
     if (!group_ctx) {
@@ -3790,19 +3874,20 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
     int total_shards = rs_info.data_shards_count + rs_info.parity_shards_count;
 
     int is_corrupted = 0;
+
     for (int i = 0; i < total_shards; i++) {
         if (rs_info.marks[i] == 1) {
             printf("Shard index %d corrupted, data %d shards, parity %d shards\n",i, rs_info.data_shards_count, rs_info.parity_shards_count);
             is_corrupted = 1;
         }
     }
+
     if (is_corrupted) {
-        reed_solomon* rs = reed_solomon_new(rs_info.data_shards_count, rs_info.parity_shards_count);
-        if (rs) {
+        fec_t *code = fec_new(rs_info.data_shards_count, total_shards);
+        if (code) {
             // 执行RS解码
             printf("Reconstructing missing chunks\n");
-            int decode_result = reed_solomon_reconstruct(rs, rs_info.shards, rs_info.marks, total_shards, rs_info.shard_size);
-
+            int decode_result = fec_reconstruct(code, rs_info.shards, rs_info.marks, rs_info.shard_size);
             if (decode_result == 0) {
                 printf("RS reconstruction successful!\n");
             }
@@ -3810,14 +3895,13 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
                 printf("RS reconstruction failed with error code: %d\n", decode_result);
                 ret = -1;
             }
-
-            // 清理资源
-            reed_solomon_release(rs);
+            fec_free(code);
         }
         else {
             printf("Failed to create RS decoder\n");
             ret = -1;
         }
+        
     }
 
     for (int i = 0; i < rs_info.data_shards_count; i++) {
@@ -4068,7 +4152,7 @@ void print_usage(const char* progname) {
     printf("  -z, --compress <level>      Set ZSTD compression level (1-22, default: 3)\n");
     printf("                              Use -z 0 to disable compression\n");
     printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (data + parity shards)\n");
-    printf("  --rs-group-size <size>      Set RS group size (default: 100M)\n");
+    printf("  --rs-group-size <size>      Set RS group size (default: 512M)\n");
     printf("\nFeatures:\n");
     printf("  - Supports empty directories\n");
     printf("  - Supports empty files (0 bytes)\n");
@@ -4198,11 +4282,17 @@ int main(int argc, char* argv[]) {
         }
         // 冗余设置
         if (rs_data > 0 && rs_parity > 0) {
-            g_rs_enabled = 1;
-            g_rs_data_shards = rs_data;
-            g_rs_parity_shards = rs_parity;
-            g_current_block_group_index = 1;
-            printf("RS redundancy enabled: %d data shards, %d parity shards\n", rs_data, rs_parity);
+            if (rs_data + rs_parity <= 256) {
+
+                g_rs_enabled = 1;
+                g_rs_data_shards = rs_data;
+                g_rs_parity_shards = rs_parity;
+                g_current_block_group_index = 1;
+                printf("RS redundancy enabled: %d data shards, %d parity shards\n", rs_data, rs_parity);
+            }
+            else {
+                printf("RS redundancy not enabled: %d data shards + %d parity shards larger than 256\n", rs_data, rs_parity);
+            }
         }
 
         if (rs_group_size_index != -1) {
