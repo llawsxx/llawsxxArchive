@@ -293,6 +293,20 @@ int stat64_utf8(const char* path, struct _stat64* buffer) {
     return result;
 }
 
+int mkdir_utf8(const char* pathname) {
+    wchar_t* wpath = utf8_to_utf16(pathname);
+
+    if (!wpath) {
+        return -1;  // 转换失败
+    }
+
+    // _wmkdir 创建目录，成功返回0，失败返回-1
+    int result = _wmkdir(wpath);
+
+    free(wpath);
+    return result;
+}
+
 
 // 全局块索引计数器管理
 uint64_t get_next_block_index(void) {
@@ -1740,11 +1754,11 @@ int create_directories_with_root(const char* root_path, const char* rel_path) {
     for (p = tmp + 1; *p; p++) {
         if (*p == '\\') {
             *p = 0;
-            _mkdir(tmp);
+            mkdir_utf8(tmp);
             *p = '\\';
         }
     }
-    return _mkdir(tmp);
+    return mkdir_utf8(tmp);
 }
 
 // 创建目录（兼容旧代码）
