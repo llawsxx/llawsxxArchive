@@ -1656,6 +1656,7 @@ void walk_directory(const char* path, void (*file_callback)(const char*), void (
         return;
     }
     swprintf(search_path, PATH_LEN_FOR_PROC, L"%s\\*", wchar_path);
+    free(wchar_path);
 
     WIN32_FIND_DATAW findData;
     HANDLE hFind = FindFirstFileW(search_path, &findData);
