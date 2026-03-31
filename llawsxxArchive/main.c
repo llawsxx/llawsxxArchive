@@ -39,6 +39,7 @@
 #define MAGIC_NUMBER_FILE 0x424C4F43  // "BLOC" in ASCII
 #define MAGIC_NUMBER_DIR 0x44495200   // "DIR\0" in ASCII
 #define MAX_PATH_LEN MAX_PATH
+#define PATH_LEN_FOR_PROC (MAX_PATH * 2)
 #define CRC32_SIZE 4
 
  // 标志位定义
@@ -201,7 +202,7 @@ uint8_t g_encryption_key[16] = { 0 };  // AES-128密钥
 int g_encryption_enabled = 0;        // 是否启用加密
 int g_compression_enabled = 1;        // 是否启用压缩（默认开启）
 int g_compression_level = DEFAULT_COMPRESSION_LEVEL;  // 压缩级别
-char g_output_path[MAX_PATH] = { 0 }; // 输出路径
+char g_output_path[PATH_LEN_FOR_PROC] = { 0 }; // 输出路径
 // 添加全局变量来保存输入根路径
 const char* g_input_root_path = NULL;
 int g_error_count = 0;           // 错误计数
@@ -221,6 +222,77 @@ size_t archive_read(void* ptr, size_t size);
 int archive_seek(long long offset, int origin);
 long long archive_tell(void);
 int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards_count, uint64_t group_index,uint32_t split_count);
+
+// UTF-16 转 UTF-8，返回 malloc 分配的字符串，调用者负责 free
+char* utf16_to_utf8(const wchar_t* utf16) {
+    if (!utf16) return NULL;
+
+    // 计算所需缓冲区大小
+    int size = WideCharToMultiByte(CP_UTF8, 0, utf16, -1, NULL, 0, NULL, NULL);
+    if (size == 0) return NULL;
+
+    char* utf8 = (char*)malloc(size);
+    if (!utf8) return NULL;
+
+    // 执行转换
+    if (WideCharToMultiByte(CP_UTF8, 0, utf16, -1, utf8, size, NULL, NULL) == 0) {
+        free(utf8);
+        return NULL;
+    }
+
+    return utf8;
+}
+
+
+// UTF-8 转 UTF-16，返回 malloc 分配的宽字符串，调用者负责 free
+wchar_t* utf8_to_utf16(const char* utf8) {
+    if (!utf8) return NULL;
+
+    // 计算所需缓冲区大小（宽字符数，含结尾 null）
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, NULL, 0);
+    if (size == 0) {
+        return NULL;
+    }
+
+    wchar_t* utf16 = (wchar_t*)malloc(size * sizeof(wchar_t));
+    if (!utf16) return NULL;
+
+    // 执行转换
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, utf16, size) == 0) {
+        free(utf16);
+        return NULL;
+    }
+
+    return utf16;
+}
+
+FILE* fopen_utf8(const char* filename, const char* mode) {
+    wchar_t* wfilename = utf8_to_utf16(filename);
+    wchar_t* wmode = utf8_to_utf16(mode);
+
+    if (!wfilename || !wmode) {
+        free(wfilename);
+        free(wmode);
+        return NULL;
+    }
+
+    FILE* fp = _wfopen(wfilename, wmode);
+
+    free(wfilename);
+    free(wmode);
+    return fp;
+}
+
+int stat64_utf8(const char* path, struct _stat64* buffer) {
+    wchar_t* wpath = utf8_to_utf16(path);
+    if (!wpath) return -1;
+
+    int result = _wstat64(wpath, buffer);
+
+    free(wpath);
+    return result;
+}
+
 
 // 全局块索引计数器管理
 uint64_t get_next_block_index(void) {
@@ -1249,7 +1321,7 @@ uint8_t* decompress_zstd(const uint8_t* compressed_data, size_t compressed_len, 
 }
 
 char* dirname(char* path) {
-    static char result[MAX_PATH];
+    static char result[PATH_LEN_FOR_PROC];
     if (!path || strlen(path) == 0) {
         strcpy(result, ".");
         return result;
@@ -1292,13 +1364,13 @@ const char* get_last_path_component(const char* path) {
 // 获取文件相对于根目录的路径
 int get_relative_path(const char* full_path, const char* root_path, char* relative_path, size_t max_len) {
     // 规范化路径分隔符为反斜杠（Windows风格）
-    char norm_full[MAX_PATH];
-    char norm_root[MAX_PATH];
+    char norm_full[PATH_LEN_FOR_PROC];
+    char norm_root[PATH_LEN_FOR_PROC];
 
-    strncpy(norm_full, full_path, MAX_PATH - 1);
-    strncpy(norm_root, root_path, MAX_PATH - 1);
-    norm_full[MAX_PATH - 1] = '\0';
-    norm_root[MAX_PATH - 1] = '\0';
+    strncpy(norm_full, full_path, PATH_LEN_FOR_PROC - 1);
+    strncpy(norm_root, root_path, PATH_LEN_FOR_PROC - 1);
+    norm_full[PATH_LEN_FOR_PROC - 1] = '\0';
+    norm_root[PATH_LEN_FOR_PROC - 1] = '\0';
 
     // 将所有正斜杠转换为反斜杠
     for (int i = 0; norm_full[i]; i++) {
@@ -1370,7 +1442,7 @@ int get_relative_path(const char* full_path, const char* root_path, char* relati
 long long get_file_size(const char* filename) {
     struct __stat64 st;
     long long filesize = 0;
-    if (_stat64(filename, &st) == 0) {
+    if (stat64_utf8(filename, &st) == 0) {
         filesize = st.st_size;
     }
     return filesize;
@@ -1379,7 +1451,7 @@ long long get_file_size(const char* filename) {
 // 检查路径是否为目录
 int is_directory(const char* path) {
     struct __stat64 st;
-    if (_stat64(path, &st) == 0) {
+    if (stat64_utf8(path, &st) == 0) {
         return (st.st_mode & _S_IFDIR) != 0;
     }
     return 0;
@@ -1562,12 +1634,18 @@ void format_datetime(uint64_t timestamp, char* buffer, size_t buffer_size) {
 
 // Windows下遍历目录的函数
 void walk_directory(const char* path, void (*file_callback)(const char*), void (*dir_callback)(const char*)) {
-    char search_path[MAX_PATH];
-    snprintf(search_path, MAX_PATH, "%s\\*", path);
+    WCHAR search_path[PATH_LEN_FOR_PROC];
+    WCHAR* wchar_path = utf8_to_utf16(path);
+    if (wchar_path == NULL) {
+        printf("Error: path UTF8 to UTF16 failed\n");
+        g_error_count++;
+        return;
+    }
+    swprintf(search_path, PATH_LEN_FOR_PROC, L"%s\\*", wchar_path);
 
-    WIN32_FIND_DATAA findData;
-    HANDLE hFind = FindFirstFileA(search_path, &findData);
-
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW(search_path, &findData);
+    char* utf8_filename = NULL;
     if (hFind == INVALID_HANDLE_VALUE) {
         printf("Error: Cannot open directory %s (error: %lu)\n", path, GetLastError());
         g_error_count++;
@@ -1575,18 +1653,21 @@ void walk_directory(const char* path, void (*file_callback)(const char*), void (
     }
 
     do {
-        if (strcmp(findData.cFileName, ".") != 0 &&
-            strcmp(findData.cFileName, "..") != 0) {
+        if (utf8_filename) {
+            free(utf8_filename);
+        }
+        utf8_filename = utf16_to_utf8(findData.cFileName);
+        if (utf8_filename == NULL) {
+            printf("Error: UTF16 to UTF8 failed\n");
+            g_error_count++;
+            break;
+        }
+        if (strcmp(utf8_filename, ".") != 0 &&
+            strcmp(utf8_filename, "..") != 0) {
 
-            char full_path[MAX_PATH];
-            snprintf(full_path, MAX_PATH, "%s\\%s", path, findData.cFileName);
+            char full_path[PATH_LEN_FOR_PROC];
+            snprintf(full_path, PATH_LEN_FOR_PROC, "%s\\%s", path, utf8_filename);
 
-            // 检查路径长度
-            if (strlen(full_path) >= MAX_PATH) {
-                printf("Error: Path too long %s\n", full_path);
-                g_error_count++;
-                break;
-            }
 
             if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 // 先处理目录本身
@@ -1602,7 +1683,7 @@ void walk_directory(const char* path, void (*file_callback)(const char*), void (
                 }
             }
         }
-    } while (FindNextFileA(hFind, &findData));
+    } while (FindNextFileW(hFind, &findData));
 
     DWORD error = GetLastError();
     if (error != ERROR_NO_MORE_FILES) {
@@ -1611,17 +1692,20 @@ void walk_directory(const char* path, void (*file_callback)(const char*), void (
     }
 
     FindClose(hFind);
+    if (utf8_filename) {
+        free(utf8_filename);
+    }
 }
 
 // Windows下创建目录（支持指定根路径）
 int create_directories_with_root(const char* root_path, const char* rel_path) {
-    char full_path[MAX_PATH];
+    char full_path[PATH_LEN_FOR_PROC];
 
     if (root_path && strlen(root_path) > 0) {
         // 规范化根路径
-        char norm_root[MAX_PATH];
-        strncpy(norm_root, root_path, MAX_PATH - 1);
-        norm_root[MAX_PATH - 1] = '\0';
+        char norm_root[PATH_LEN_FOR_PROC];
+        strncpy(norm_root, root_path, PATH_LEN_FOR_PROC - 1);
+        norm_root[PATH_LEN_FOR_PROC - 1] = '\0';
 
         // 去除根路径末尾的斜杠
         size_t root_len = strlen(norm_root);
@@ -1630,11 +1714,11 @@ int create_directories_with_root(const char* root_path, const char* rel_path) {
         }
 
         // 构建完整路径
-        snprintf(full_path, MAX_PATH, "%s\\%s", norm_root, rel_path);
+        snprintf(full_path, PATH_LEN_FOR_PROC, "%s\\%s", norm_root, rel_path);
     }
     else {
-        strncpy(full_path, rel_path, MAX_PATH - 1);
-        full_path[MAX_PATH - 1] = '\0';
+        strncpy(full_path, rel_path, PATH_LEN_FOR_PROC - 1);
+        full_path[PATH_LEN_FOR_PROC - 1] = '\0';
     }
 
     // 将正斜杠转换为反斜杠（Windows）
@@ -1643,7 +1727,7 @@ int create_directories_with_root(const char* root_path, const char* rel_path) {
     }
 
     // 创建目录
-    char tmp[MAX_PATH];
+    char tmp[PATH_LEN_FOR_PROC];
     char* p = NULL;
     size_t len;
 
@@ -1672,9 +1756,9 @@ int create_directories(const char* path) {
 void build_output_path(const char* output_root, const char* rel_path, char* out_path, size_t max_len) {
     if (output_root && strlen(output_root) > 0) {
         // 规范化输出根路径
-        char norm_root[MAX_PATH];
-        strncpy(norm_root, output_root, MAX_PATH - 1);
-        norm_root[MAX_PATH - 1] = '\0';
+        char norm_root[PATH_LEN_FOR_PROC];
+        strncpy(norm_root, output_root, PATH_LEN_FOR_PROC - 1);
+        norm_root[PATH_LEN_FOR_PROC - 1] = '\0';
 
         // 去除根路径末尾的斜杠
         size_t root_len = strlen(norm_root);
@@ -1722,7 +1806,7 @@ int volume_open_next(VolumeContext* vol) {
         printf("Creating archive: %s\n", vol_name);
     }
 
-    vol->current_file = fopen(vol_name, "wb");
+    vol->current_file = fopen_utf8(vol_name, "wb");
     if (!vol->current_file) {
         printf("Error: Cannot create volume file: %s\n", vol_name);
         return -1;
@@ -1803,7 +1887,7 @@ int volume_read_init(VolumeReadContext* ctx, const char* archive_name) {
     ctx->current_file[sizeof(ctx->current_file) - 1] = '\0';
 
     // 尝试打开文件
-    ctx->file = fopen(archive_name, "rb");
+    ctx->file = fopen_utf8(archive_name, "rb");
     if (ctx->file) {
         ctx->is_open = 1;
         ctx->file_size = get_file_size(archive_name);
@@ -1837,7 +1921,7 @@ int volume_read_next(VolumeReadContext* ctx) {
     char next_vol[512];
     get_volume_filename(ctx->base_name, ctx->current_volume, next_vol, sizeof(next_vol));
 
-    ctx->file = fopen(next_vol, "rb");
+    ctx->file = fopen_utf8(next_vol, "rb");
     if (!ctx->file) {
         return -1;  // 没有更多分卷
     }
@@ -1935,7 +2019,7 @@ void process_directory(const char* dirpath) {
 
     // 获取目录信息
     struct __stat64 st;
-    if (_stat64(dirpath, &st) != 0) {
+    if (stat64_utf8(dirpath, &st) != 0) {
         printf("Error: Cannot get directory stat %s\n", dirpath);
         g_error_count++;
         return;
@@ -1976,7 +2060,7 @@ void process_directory(const char* dirpath) {
 
 // 处理单个文件的回调函数
 void process_file(const char* filepath) {
-    FILE* infile = fopen(filepath, "rb");
+    FILE* infile = fopen_utf8(filepath, "rb");
     if (!infile) {
         printf("Error: Cannot open file %s\n", filepath);
         g_error_count++;
@@ -1985,7 +2069,7 @@ void process_file(const char* filepath) {
 
     // 获取文件信息
     struct __stat64 st;
-    if (_stat64(filepath, &st) != 0) {
+    if (stat64_utf8(filepath, &st) != 0) {
         printf("Error: Cannot get file stat %s\n", filepath);
         fclose(infile);
         g_error_count++;
@@ -2250,9 +2334,9 @@ int create_archive(const char* archive_name, const char* input_path) {
     g_warning_count = 0;
 
     // 保存输入根路径供回调函数使用
-    static char input_root[MAX_PATH];
-    strncpy(input_root, input_path, MAX_PATH - 1);
-    input_root[MAX_PATH - 1] = '\0';
+    static char input_root[PATH_LEN_FOR_PROC];
+    strncpy(input_root, input_path, PATH_LEN_FOR_PROC - 1);
+    input_root[PATH_LEN_FOR_PROC - 1] = '\0';
     // 去除末尾的斜杠
     size_t root_len = strlen(input_root);
     while (root_len > 0 && (input_root[root_len - 1] == '\\' || input_root[root_len - 1] == '/')) {
@@ -3032,7 +3116,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             if (file_index >= 0 && extracting_files[file_index].outfile == NULL) {
                 total_file_in_archive++;
                 // 第一次遇到这个文件，打开输出文件
-                char output_file_path[MAX_PATH];
+                char output_file_path[PATH_LEN_FOR_PROC];
                 build_output_path(g_output_path, header.filename, output_file_path, sizeof(output_file_path));
 
                 printf("Extracting: %s", header.filename);
@@ -3049,7 +3133,7 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                 free(dir_path);
 
                 // 打开输出文件
-                extracting_files[file_index].outfile = fopen(output_file_path, "wb");
+                extracting_files[file_index].outfile = fopen_utf8(output_file_path, "wb");
                 if (!extracting_files[file_index].outfile) {
                     printf("Error: Cannot create file %s\n", output_file_path);
                     ret = -1;
@@ -3225,8 +3309,8 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
 
                     if (ef->corrupted) {
                         corrupted_files++;
-                        char new_file_name[MAX_PATH];
-                        char original_path[MAX_PATH];
+                        char new_file_name[PATH_LEN_FOR_PROC];
+                        char original_path[PATH_LEN_FOR_PROC];
                         build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
                         snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
                         printf("File %s corrupted, rename to %s\n", ef->filename, new_file_name);
@@ -3266,8 +3350,8 @@ cleanup:
             if (ef->outfile) {
                 fclose(ef->outfile);
                 ef->outfile = NULL;
-                char new_file_name[MAX_PATH];
-                char original_path[MAX_PATH];
+                char new_file_name[PATH_LEN_FOR_PROC];
+                char original_path[PATH_LEN_FOR_PROC];
                 build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
                 snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
 
@@ -4182,7 +4266,10 @@ void print_usage(const char* progname) {
     printf("  When extracting, specify the first volume (e.g., archive.001.lxar)\n");
 }
 
-int main(int argc, char* argv[]) {
+
+
+
+int _main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -4306,7 +4393,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char archive_name[MAX_PATH_LEN];
+        char archive_name[PATH_LEN_FOR_PROC];
         if (output_index != -1) {
             // 使用指定的输出文件名
             strncpy(archive_name, argv[output_index], sizeof(archive_name) - 1);
@@ -4352,8 +4439,8 @@ int main(int argc, char* argv[]) {
 
         // 处理输出路径
         if (output_index != -1) {
-            strncpy(g_output_path, argv[output_index], MAX_PATH - 1);
-            g_output_path[MAX_PATH - 1] = '\0';
+            strncpy(g_output_path, argv[output_index], PATH_LEN_FOR_PROC - 1);
+            g_output_path[PATH_LEN_FOR_PROC - 1] = '\0';
             // 创建输出目录
             create_directories(g_output_path);
         }
@@ -4419,7 +4506,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char repaired_archive_name[MAX_PATH_LEN];
+        char repaired_archive_name[PATH_LEN_FOR_PROC];
         if (output_index != -1) {
             strncpy(repaired_archive_name, argv[output_index], sizeof(repaired_archive_name) - 1);
             repaired_archive_name[sizeof(repaired_archive_name) - 1] = '\0';
@@ -4436,4 +4523,60 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
+}
+
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    // 获取 UTF-16 格式的命令行
+    int ret = 0;
+    int argc;
+    LPWSTR cmdLine = GetCommandLineW();
+    LPWSTR* argv = CommandLineToArgvW(cmdLine, &argc);
+    char** utf8_argv = NULL;
+
+    if (!argv) {
+        fprintf(stderr, "Failed to parse command line\n");
+        ret = -1;
+        goto end;
+    }
+
+    utf8_argv = calloc(argc, sizeof(char*));
+
+    if (!utf8_argv) {
+        fprintf(stderr, "Failed to malloc utf8_argv\n");
+        ret = -1;
+        goto end;
+    }
+
+    for (int i = 0; i < argc; i++) {
+        char* utf8_arg = utf16_to_utf8(argv[i]);
+
+        if (utf8_arg) {
+            utf8_argv[i] = utf8_arg;
+            printf("argv[%d]: %s\n", i, utf8_arg);
+        }
+        else {
+            printf("argv[%d]: <conversion failed>\n", i);
+            ret = -1;
+            goto end;
+        }
+    }
+
+    ret = _main(argc, utf8_argv);
+
+    // 释放 CommandLineToArgvW 分配的内存
+end:
+    if (utf8_argv)
+    {
+        for (int i = 0; i < argc; i++) {
+            if (utf8_argv[i]) {
+                free(utf8_argv[i]);
+            }
+        }
+        free(utf8_argv);
+    }
+    if (argv)
+        LocalFree(argv);
+    return ret;
 }
