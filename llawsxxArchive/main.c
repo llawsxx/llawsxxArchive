@@ -2367,9 +2367,6 @@ int create_archive(const char* archive_name, const char* input_path) {
             g_volume_size / (1024.0 * 1024.0 * 1024.0));
         printf("Maximum volumes supported: %d\n", MAX_VOLUME_NUMBER);
     }
-    else {
-        printf("Creating archive: %s\n", archive_name);
-    }
 
     printf("Input path: %s\n", input_path);
     printf("Section size: %u bytes (%.2f KB, %.2f MB)\n",
@@ -3471,7 +3468,7 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
         goto cleanup;
     }
 
-    blocknums = malloc(sizeof(size_t) * parity_shards_count);
+    blocknums = malloc(sizeof(unsigned int) * parity_shards_count);
 
     if (!blocknums) {
         ret = -1;
@@ -3881,7 +3878,7 @@ int fec_reconstruct(fec_t* code,
 {
     int i;
     int k, n;
-    int avail = 0, pn = 0, j = 0;
+    int pn = 0, j = 0;
     unsigned* indexes = NULL;
     unsigned char** inpkts = NULL;
     unsigned char** outpkts = NULL;
@@ -3907,30 +3904,30 @@ int fec_reconstruct(fec_t* code,
         if (!marks[i]) {
             inpkts[i] = shards[i];
             indexes[i] = (unsigned int)i;
-            avail++;
         }
         else {
+            int found = 0;
             while(pn < n - k) {
                 if (!marks[k + pn]) {
                     inpkts[i] = shards[k + pn];
                     indexes[i] = (unsigned int)(k + pn);
                     outpkts[j++] = shards[i];
-                    avail++;
                     pn++;
+                    found = 1;
                     break;
                 }
                 else {
                     pn++;
                 }
             }
+            if (!found) {
+                // 可用块不足
+                ret = -1;
+                goto end;
+            }
         }
     }
 
-    // zfec 的 decode 要求：至少有 k 个可用块
-    if (avail < k) {
-        ret = -1;
-        goto end;
-    }
 
     fec_decode(code,
         (const gf* const*)inpkts,
@@ -4157,7 +4154,7 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
         if (block_available) {
             // group_id大于0的组才会有冗余数据
             if (header.block_group_id == 0) {
-                size_t written = write_block_header(&header, 0);
+                size_t written = archive_write(&raw_header, sizeof(BlockHeader), 1, 0);;
                 if (written != sizeof(BlockHeader)) {
                     printf("  Warning: Failed to write block id %llu header\n", header.block_id);
                 }
@@ -4167,7 +4164,7 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                         printf("  Warning: Failed to write block id %llu data\n", header.block_id);
                     }
                 }
-                written = write_crc32(stored_crc, 0);
+                written = archive_write(&stored_raw_crc, sizeof(uint32_t), 0, 0);
                 if (written != sizeof(uint32_t)) {
                     printf("  Warning: Failed to write block id %llu crc32\n", header.block_id);
                 }
