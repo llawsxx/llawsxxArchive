@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <direct.h>
 #include <zstd.h>
+#include <zdict.h>
 #include <errno.h>
 
 #define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
@@ -46,9 +47,23 @@
 #define FLAG_ENCRYPTED 0x01  // 数据已加密
 #define FLAG_COMPRESSED 0x02  // 数据已压缩 (ZSTD)
 #define FLAG_RS_REDUNDANT 0x04  // RS冗余块
+#define FLAG_DICT_COMPRESSED 0x08  // 使用ZSTD字典压缩
 
 // 默认压缩级别
 #define DEFAULT_COMPRESSION_LEVEL 3
+
+// 字典训练相关常量
+#define MAX_DICT_SIZE (128 * 1024 * 1024)  // 最大字典大小128MB
+#define MIN_TRAINING_SAMPLES 8             // 最小训练样本数
+
+// 字典头部信息（存储在压缩数据之前）
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t dict_id;          // 字典ID
+    uint32_t data_size;        // 原始数据大小（压缩前）
+} DictDataHeader;
+#pragma pack(pop)
+
 
 #pragma pack(push, 1)
 typedef struct {
@@ -90,6 +105,19 @@ typedef struct {
     // 最后是实际的冗余数据
 } RSBlockHeader;
 #pragma pack(pop)
+
+
+// 字典上下文结构体
+typedef struct {
+    uint8_t* dict_data;        // 字典数据
+    size_t dict_size;          // 字典大小
+    uint32_t dict_id;          // 字典ID（基于内容的CRC32哈希）
+    ZSTD_CDict* cdict;         // 压缩字典引用
+    ZSTD_DDict* ddict;         // 解压字典引用
+    ZSTD_CCtx* cctx;           // 压缩上下文（复用）
+    ZSTD_DCtx* dctx;           // 解压上下文（复用）
+    int is_loaded;             // 是否已加载
+} DictContext;
 
 typedef struct {
     char filename[MAX_PATH_LEN];
@@ -215,6 +243,8 @@ int g_rs_enabled = 0;                // 是否启用RS冗余
 int g_rs_data_shards = 0;            // RS数据分片数
 int g_rs_parity_shards = 0;          // RS校验分片数
 uint64_t g_rs_group_size = 512 * 1024 * 1024;
+// 全局字典上下文
+DictContext* g_dict_ctx = NULL;
 
 // 函数声明
 size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int is_write_rs);
@@ -305,6 +335,191 @@ int mkdir_utf8(const char* pathname) {
 
     free(wpath);
     return result;
+}
+
+// 初始化字典上下文
+DictContext* init_dict_context(void) {
+    DictContext* ctx = (DictContext*)malloc(sizeof(DictContext));
+    if (!ctx) return NULL;
+
+    ctx->dict_data = NULL;
+    ctx->dict_size = 0;
+    ctx->dict_id = 0;
+    ctx->cdict = NULL;
+    ctx->ddict = NULL;
+    ctx->cctx = NULL;
+    ctx->dctx = NULL;
+    ctx->is_loaded = 0;
+
+    return ctx;
+}
+
+// 基于字典数据计算字典ID（CRC32哈希）
+uint32_t calculate_dict_id(const uint8_t* dict_data, size_t dict_size) {
+    return crc32_calc(dict_data, (uint32_t)dict_size);
+}
+
+// 释放字典上下文
+void free_dict_context(DictContext* ctx) {
+    if (!ctx) return;
+
+    if (ctx->cctx) {
+        ZSTD_freeCCtx(ctx->cctx);
+        ctx->cctx = NULL;
+    }
+
+    if (ctx->dctx) {
+        ZSTD_freeDCtx(ctx->dctx);
+        ctx->dctx = NULL;
+    }
+
+    if (ctx->cdict) {
+        ZSTD_freeCDict(ctx->cdict);
+        ctx->cdict = NULL;
+    }
+
+    if (ctx->ddict) {
+        ZSTD_freeDDict(ctx->ddict);
+        ctx->ddict = NULL;
+    }
+
+    if (ctx->dict_data) {
+        free(ctx->dict_data);
+        ctx->dict_data = NULL;
+    }
+
+    free(ctx);
+}
+
+// 从文件加载字典（修正版 - 支持大文件）
+int load_dict_from_file(const char* dict_file) {
+    struct __stat64 st;
+    if (stat64_utf8(dict_file, &st) != 0) {
+        printf("Error: Cannot access dictionary file: %s\n", dict_file);
+        return -1;
+    }
+
+    // 使用64位文件大小
+    uint64_t file_size = st.st_size;
+
+    if (file_size == 0) {
+        printf("Error: Dictionary file is empty: %s\n", dict_file);
+        return -1;
+    }
+
+    if (file_size > MAX_DICT_SIZE) {
+        printf("Error: Dictionary file too large: %llu bytes (max: %d bytes, %.2f MB)\n",
+            (unsigned long long)file_size, MAX_DICT_SIZE, MAX_DICT_SIZE / (1024.0 * 1024.0));
+        return -1;
+    }
+
+    printf("Loading dictionary from: %s\n", dict_file);
+    printf("  - Size: %llu bytes (%.2f KB)\n",
+        (unsigned long long)file_size, file_size / 1024.0);
+
+    // 读取字典数据
+    uint8_t* dict_data = (uint8_t*)malloc((size_t)file_size);
+    if (!dict_data) {
+        printf("Error: Out of memory for dictionary (%llu bytes)\n", (unsigned long long)file_size);
+        return -1;
+    }
+
+    FILE* f = fopen_utf8(dict_file, "rb");
+    if (!f) {
+        printf("Error: Cannot open dictionary file: %s\n", dict_file);
+        free(dict_data);
+        return -1;
+    }
+
+    // 分块读取，避免单次读取过大
+    size_t total_read = 0;
+    size_t remaining = (size_t)file_size;
+
+    while (remaining > 0) {
+        size_t chunk_size = remaining > (16 * 1024 * 1024) ? (16 * 1024 * 1024) : remaining;
+        size_t read_size = fread(dict_data + total_read, 1, chunk_size, f);
+
+        if (read_size == 0) {
+            if (ferror(f)) {
+                printf("Error: Read error at offset %zu\n", total_read);
+                fclose(f);
+                free(dict_data);
+                return -1;
+            }
+            break;
+        }
+
+        total_read += read_size;
+        remaining -= read_size;
+    }
+
+    fclose(f);
+
+    if (total_read != file_size) {
+        printf("Error: Failed to read entire dictionary (got %zu, expected %llu)\n",
+            total_read, (unsigned long long)file_size);
+        free(dict_data);
+        return -1;
+    }
+
+    // 初始化或重置字典上下文
+    if (g_dict_ctx) {
+        free_dict_context(g_dict_ctx);
+    }
+
+    g_dict_ctx = init_dict_context();
+    if (!g_dict_ctx) {
+        free(dict_data);
+        return -1;
+    }
+
+    g_dict_ctx->dict_data = dict_data;
+    g_dict_ctx->dict_size = total_read;
+    g_dict_ctx->dict_id = calculate_dict_id(dict_data, total_read);
+    g_dict_ctx->is_loaded = 1;
+
+    // 创建压缩上下文并创建CDict
+    g_dict_ctx->cctx = ZSTD_createCCtx();
+    if (!g_dict_ctx->cctx) {
+        printf("Error: Failed to create compression context\n");
+        free_dict_context(g_dict_ctx);
+        g_dict_ctx = NULL;
+        return -1;
+    }
+
+    g_dict_ctx->cdict = ZSTD_createCDict(dict_data, total_read, g_compression_level);
+    if (!g_dict_ctx->cdict) {
+        printf("Error: Failed to create compression dictionary reference\n");
+        free_dict_context(g_dict_ctx);
+        g_dict_ctx = NULL;
+        return -1;
+    }
+
+    // 创建解压上下文并创建DDict
+    g_dict_ctx->dctx = ZSTD_createDCtx();
+    if (!g_dict_ctx->dctx) {
+        printf("Error: Failed to create decompression context\n");
+        free_dict_context(g_dict_ctx);
+        g_dict_ctx = NULL;
+        return -1;
+    }
+
+    g_dict_ctx->ddict = ZSTD_createDDict(dict_data, total_read);
+    if (!g_dict_ctx->ddict) {
+        printf("Error: Failed to create decompression dictionary reference\n");
+        free_dict_context(g_dict_ctx);
+        g_dict_ctx = NULL;
+        return -1;
+    }
+
+    printf("Dictionary loaded successfully:\n");
+    printf("  - File: %s\n", dict_file);
+    printf("  - Size: %zu bytes (%.2f KB)\n", g_dict_ctx->dict_size,
+        g_dict_ctx->dict_size / 1024.0);
+    printf("  - ID: 0x%08x\n", g_dict_ctx->dict_id);
+    printf("  - Compression level: %d\n", g_compression_level);
+
+    return 0;
 }
 
 
@@ -1309,6 +1524,77 @@ uint8_t* compress_zstd(const uint8_t* data, size_t data_len, size_t* compressed_
     return compressed;
 }
 
+// ZSTD压缩函数（支持字典）
+uint8_t* compress_zstd_with_dict(const uint8_t* data, size_t data_len,
+    size_t* compressed_len, int level,
+    int* used_dict, uint32_t* dict_id) {
+    *used_dict = 0;
+    *dict_id = 0;
+
+    // 获取最大压缩后大小
+    size_t max_compressed_size = ZSTD_compressBound(data_len);
+
+    // 如果使用字典，需要额外空间存储DictDataHeader
+    if (g_dict_ctx && g_dict_ctx->is_loaded && g_dict_ctx->cdict) {
+        max_compressed_size += sizeof(DictDataHeader);
+    }
+
+    uint8_t* compressed = (uint8_t*)malloc(max_compressed_size);
+    if (!compressed) {
+        printf("Error: Failed to allocate compression buffer\n");
+        return NULL;
+    }
+
+    // 尝试使用字典压缩
+    if (g_dict_ctx && g_dict_ctx->is_loaded && g_dict_ctx->cctx && g_dict_ctx->cdict) {
+        // 使用字典压缩
+        size_t dict_compressed_len = ZSTD_compress_usingCDict(
+            g_dict_ctx->cctx,
+            compressed + sizeof(DictDataHeader),
+            max_compressed_size - sizeof(DictDataHeader),
+            data, data_len,
+            g_dict_ctx->cdict
+        );
+
+        if (!ZSTD_isError(dict_compressed_len)) {
+            // 字典压缩成功，添加DictDataHeader
+            DictDataHeader dict_header;
+            dict_header.dict_id = htobe32(g_dict_ctx->dict_id);
+            dict_header.data_size = htobe32((uint32_t)data_len);
+            memcpy(compressed, &dict_header, sizeof(DictDataHeader));
+
+            *compressed_len = dict_compressed_len + sizeof(DictDataHeader);
+            *used_dict = 1;
+            *dict_id = g_dict_ctx->dict_id;
+            return compressed;
+        }
+        else {
+            // 字典压缩失败，回退到普通压缩
+            printf("Warning: Dictionary compression failed, falling back to normal: %s\n",
+                ZSTD_getErrorName(dict_compressed_len));
+        }
+    }
+
+    // 普通压缩（需要创建临时上下文）
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    if (!cctx) {
+        printf("Error: Failed to create compression context\n");
+        free(compressed);
+        return NULL;
+    }
+
+    *compressed_len = ZSTD_compressCCtx(cctx, compressed, max_compressed_size, data, data_len, level);
+    ZSTD_freeCCtx(cctx);
+
+    if (ZSTD_isError(*compressed_len)) {
+        printf("Error: ZSTD compression failed: %s\n", ZSTD_getErrorName(*compressed_len));
+        free(compressed);
+        return NULL;
+    }
+
+    return compressed;
+}
+
 // ZSTD解压缩函数
 uint8_t* decompress_zstd(const uint8_t* compressed_data, size_t compressed_len, size_t original_len) {
     uint8_t* decompressed = (uint8_t*)malloc(original_len);
@@ -1323,6 +1609,97 @@ uint8_t* decompress_zstd(const uint8_t* compressed_data, size_t compressed_len, 
         printf("Error: ZSTD decompression failed: %s\n", ZSTD_getErrorName(result));
         free(decompressed);
         return NULL;
+    }
+
+    if (result != original_len) {
+        printf("Error: Decompressed size mismatch: expected %zu, got %zu\n", original_len, result);
+        free(decompressed);
+        return NULL;
+    }
+
+    return decompressed;
+}
+
+// ZSTD解压缩函数（支持字典）
+uint8_t* decompress_zstd_with_dict(const uint8_t* compressed_data, size_t compressed_len,
+    size_t expected_original_len, int has_dict_flag) {
+    uint8_t* decompressed = NULL;
+    size_t original_len = expected_original_len;
+    const uint8_t* actual_compressed_data = compressed_data;
+    size_t actual_compressed_len = compressed_len;
+    int used_dict = 0;
+    uint32_t stored_dict_id = 0;
+
+    // 检查是否有字典压缩标志
+    if (has_dict_flag) {
+        if (compressed_len < sizeof(DictDataHeader)) {
+            printf("Error: Invalid dictionary compressed data (too small)\n");
+            return NULL;
+        }
+
+        DictDataHeader dict_header;
+        memcpy(&dict_header, compressed_data, sizeof(DictDataHeader));
+        stored_dict_id = be32toh(dict_header.dict_id);
+        original_len = be32toh(dict_header.data_size);
+
+        actual_compressed_data = compressed_data + sizeof(DictDataHeader);
+        actual_compressed_len = compressed_len - sizeof(DictDataHeader);
+
+        used_dict = 1;
+
+        // 验证字典是否加载
+        if (!g_dict_ctx || !g_dict_ctx->is_loaded || !g_dict_ctx->ddict || !g_dict_ctx->dctx) {
+            printf("Error: Dictionary required for decompression (dict_id: 0x%08x) but not loaded\n",
+                stored_dict_id);
+            return NULL;
+        }
+
+        // 验证字典ID
+        if (g_dict_ctx->dict_id != stored_dict_id) {
+            printf("Warning: Dictionary ID mismatch (loaded: 0x%08x, expected: 0x%08x), attempting decompression anyway\n",
+                g_dict_ctx->dict_id, stored_dict_id);
+        }
+    }
+
+    // 分配解压缓冲区
+    decompressed = (uint8_t*)malloc(original_len);
+    if (!decompressed) {
+        printf("Error: Failed to allocate decompression buffer\n");
+        return NULL;
+    }
+
+    size_t result;
+
+    if (used_dict) {
+        // 使用字典解压（复用上下文字典）
+        result = ZSTD_decompress_usingDDict(g_dict_ctx->dctx, decompressed, original_len,
+            actual_compressed_data, actual_compressed_len,
+            g_dict_ctx->ddict);
+
+        if (ZSTD_isError(result)) {
+            printf("Error: Dictionary decompression failed: %s\n", ZSTD_getErrorName(result));
+            free(decompressed);
+            return NULL;
+        }
+    }
+    else {
+        // 普通解压（创建临时上下文）
+        ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        if (!dctx) {
+            printf("Error: Failed to create decompression context\n");
+            free(decompressed);
+            return NULL;
+        }
+
+        result = ZSTD_decompressDCtx(dctx, decompressed, original_len,
+            compressed_data, compressed_len);
+        ZSTD_freeDCtx(dctx);
+
+        if (ZSTD_isError(result)) {
+            printf("Error: ZSTD decompression failed: %s\n", ZSTD_getErrorName(result));
+            free(decompressed);
+            return NULL;
+        }
     }
 
     if (result != original_len) {
@@ -2184,12 +2561,17 @@ void process_file(const char* filepath) {
             uint32_t data_to_write_len = section_size;
             uint32_t original_len = section_size;
             uint32_t compressed_len = 0;
+            int used_dict = 0;
 
             // 压缩数据（如果启用压缩）
             if (g_compression_enabled) {
+                uint32_t dict_id = 0;
                 size_t zstd_compressed_len;
-                uint8_t* compressed_data = compress_zstd(original_buffer, section_size,
-                    &zstd_compressed_len, g_compression_level);
+                uint8_t* compressed_data = compress_zstd_with_dict(
+                    original_buffer, section_size,
+                    &zstd_compressed_len, g_compression_level,
+                    &used_dict, &dict_id
+                );
 
                 if (compressed_data) {
                     // 只有在压缩后确实变小了才使用压缩数据
@@ -2244,7 +2626,14 @@ void process_file(const char* filepath) {
             header.total_section_count = total_section_count;
             header.flags = 0;
             if (g_encryption_enabled) header.flags |= FLAG_ENCRYPTED;
-            if (g_compression_enabled && compressed_len > 0) header.flags |= FLAG_COMPRESSED;
+            if (g_compression_enabled && compressed_len > 0) {
+                header.flags |= FLAG_COMPRESSED; 
+                // 设置字典压缩标志
+                if (used_dict) {
+                    header.flags |= FLAG_DICT_COMPRESSED;
+                }
+            }
+
             header.data_offset = file_offset;
             header.original_size = original_len;  // 保存原始大小用于解压缩
 
@@ -2521,9 +2910,17 @@ int list_archive(const char* archive_name) {
         format_datetime(header.mtime, datetime_str, sizeof(datetime_str));
 
         // 构建标志字符串
-        char flags_str[16] = "";
+        char flags_str[32] = "";
         if (header.flags & FLAG_ENCRYPTED) strcat(flags_str, "AES ");
-        if (header.flags & FLAG_COMPRESSED) strcat(flags_str, "ZSTD");
+        if (header.flags & FLAG_COMPRESSED) {
+            if (strlen(flags_str) > 0) strcat(flags_str, " ");
+            if (header.flags & FLAG_DICT_COMPRESSED) {
+                strcat(flags_str, "ZSTD+Dict");
+            }
+            else {
+                strcat(flags_str, "ZSTD");
+            }
+        }
         if (strlen(flags_str) == 0) strcpy(flags_str, "-");
 
         if (header.magic == MAGIC_NUMBER_DIR) {
@@ -2799,9 +3196,15 @@ int verify_archive(const char* archive_name) {
                 }
 
                 // 构建标志字符串
-                char flags_str[32] = "";
+                char flags_str[64] = "";
                 if (header.flags & FLAG_ENCRYPTED) strcat(flags_str, "encrypted ");
-                if (header.flags & FLAG_COMPRESSED) strcat(flags_str, "compressed");
+                if (header.flags & FLAG_COMPRESSED) {
+                    if (strlen(flags_str) > 0) strcat(flags_str, " ");
+                    strcat(flags_str, "compressed(ZSTD)");
+                    if (header.flags & FLAG_DICT_COMPRESSED) {
+                        strcat(flags_str, "+dict");
+                    }
+                }
 
                 // 显示section信息
                 printf("%-30s %-20s %-10s %s (Block id %llu, Group id %llu, Section id %llu/%llu, Data Offset %llu, Original Size: %u,Section Size: %u, CRC: 0x%08x%s%s)\n",
@@ -3248,7 +3651,12 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
                     uint32_t final_len = data_len;
 
                     if (header.flags & FLAG_COMPRESSED) {
-                        uint8_t* decompressed = decompress_zstd(data_buffer, data_len, original_len);
+                        int has_dict = (header.flags & FLAG_DICT_COMPRESSED) != 0;
+
+                        uint8_t* decompressed = decompress_zstd_with_dict(
+                            data_buffer, data_len, original_len, has_dict
+                        );
+
                         if (!decompressed) {
                             printf("Error: Decompression failed for %s section id %llu\n",
                                 ef->filename, (unsigned long long)header.section_id);
@@ -4226,15 +4634,248 @@ cleanup:
     return ret;
 }
 
-// 打印使用帮助
+// 训练字典函数（修正版 - 支持大文件）
+int train_dictionary(const char** file_list, int file_count,
+    const char* output_dict_file, size_t max_dict_size) {
+    if (file_count < MIN_TRAINING_SAMPLES) {
+        printf("Error: Need at least %d files for training (got %d)\n",
+            MIN_TRAINING_SAMPLES, file_count);
+        return -1;
+    }
+
+    printf("Training ZSTD dictionary...\n");
+    printf("  - Files: %d\n", file_count);
+    printf("  - Max dictionary size: %zu bytes\n", max_dict_size);
+
+    // 第一步：获取所有文件大小并计算总大小
+    size_t* sample_sizes = (size_t*)malloc(file_count * sizeof(size_t));
+
+    if (!sample_sizes) {
+        printf("Error: Out of memory\n");
+        return -1;
+    }
+
+    size_t total_samples_size = 0;
+    int valid_samples = 0;
+
+    // 定义单个样本的最大大小（64MB）
+    const size_t MAX_SAMPLE_SIZE = 64 * 1024 * 1024;
+
+    // 先获取所有文件大小
+    printf("Scanning training files...\n");
+    for (int i = 0; i < file_count; i++) {
+        struct __stat64 st;
+        if (stat64_utf8(file_list[i], &st) != 0) {
+            printf("Warning: Cannot access file: %s\n", file_list[i]);
+            sample_sizes[i] = 0;
+            continue;
+        }
+
+        // 检查是否为普通文件
+        if (!(st.st_mode & _S_IFREG)) {
+            printf("Warning: Not a regular file: %s\n", file_list[i]);
+            sample_sizes[i] = 0;
+            continue;
+        }
+
+        // 使用64位文件大小
+        uint64_t file_size = st.st_size;
+
+        if (file_size < 1024) {
+            printf("Warning: File too small (< 1024 bytes): %s (%llu bytes)\n",
+                file_list[i], (unsigned long long)file_size);
+            sample_sizes[i] = 0;
+            continue;
+        }
+
+        // 限制单个样本大小为64MB（避免内存占用过大）
+        size_t sample_size = (size_t)(file_size > MAX_SAMPLE_SIZE ?
+            MAX_SAMPLE_SIZE : file_size);
+        sample_sizes[i] = sample_size;
+        total_samples_size += sample_size;
+        valid_samples++;
+
+        printf("  - [%d] %s: %llu bytes -> sample %zu bytes\n",
+            valid_samples, file_list[i], (unsigned long long)file_size, sample_size);
+    }
+
+    if (valid_samples < MIN_TRAINING_SAMPLES) {
+        printf("Error: Only %d valid samples (need %d)\n", valid_samples, MIN_TRAINING_SAMPLES);
+        free(sample_sizes);
+        return -1;
+    }
+
+    printf("  - Valid samples: %d\n", valid_samples);
+    printf("  - Total samples size: %zu bytes (%.2f MB)\n",
+        total_samples_size, total_samples_size / (1024.0 * 1024.0));
+
+    // 检查内存限制（避免分配过大内存）
+    if (total_samples_size > 512 * 1024 * 1024) {
+        printf("Warning: Total samples size %zu exceeds 512MB, this may use a lot of memory\n",
+            total_samples_size);
+        printf("Continue? (y/n): ");
+        char response = getchar();
+        if (response != 'y' && response != 'Y') {
+            printf("Aborted by user\n");
+            free(sample_sizes);
+            return -1;
+        }
+    }
+
+    // 第二步：分配连续缓冲区并加载所有样本
+    uint8_t* samples_buffer = (uint8_t*)malloc(total_samples_size);
+    if (!samples_buffer) {
+        printf("Error: Out of memory for samples buffer (%zu bytes, %.2f MB)\n",
+            total_samples_size, total_samples_size / (1024.0 * 1024.0));
+        free(sample_sizes);
+        return -1;
+    }
+
+    size_t offset = 0;
+    int loaded_samples = 0;
+
+    printf("Loading samples into memory...\n");
+
+    for (int i = 0; i < file_count; i++) {
+        if (sample_sizes[i] == 0) {
+            continue;  // 跳过无效样本
+        }
+
+        FILE* f = fopen_utf8(file_list[i], "rb");
+        if (!f) {
+            printf("Warning: Cannot open file: %s\n", file_list[i]);
+            continue;
+        }
+
+        size_t remaining = sample_sizes[i];
+        size_t file_offset = 0;
+        size_t read_size;
+
+        // 读取样本数据（分块读取，避免单次读取过大）
+        while (remaining > 0) {
+            size_t chunk_size = remaining > (16 * 1024 * 1024) ? (16 * 1024 * 1024) : remaining;
+            read_size = fread(samples_buffer + offset + file_offset, 1, chunk_size, f);
+
+            if (read_size == 0) {
+                if (ferror(f)) {
+                    printf("Warning: Read error for %s at offset %zu\n", file_list[i], file_offset);
+                }
+                break;
+            }
+
+            file_offset += read_size;
+            remaining -= read_size;
+        }
+        fclose(f);
+
+        if (file_offset < 1024) {
+            // 读取的数据太少，跳过这个样本
+            printf("Warning: Too little data read from %s (%zu bytes), skipping\n",
+                file_list[i], file_offset);
+            sample_sizes[loaded_samples] = 0;
+            continue;
+        }
+
+        // 更新实际读取的大小
+        sample_sizes[loaded_samples] = file_offset;
+
+        printf("  - [%d] Loaded: %s (%zu bytes)\n", loaded_samples, file_list[i], file_offset);
+
+        offset += file_offset;
+        loaded_samples++;
+    }
+
+    // 更新实际加载的样本数和总大小
+    valid_samples = loaded_samples;
+    total_samples_size = offset;
+
+    if (valid_samples < MIN_TRAINING_SAMPLES) {
+        printf("Error: Only %d samples loaded successfully (need %d)\n",
+            valid_samples, MIN_TRAINING_SAMPLES);
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
+
+    printf("  - Loaded %d samples, total: %zu bytes (%.2f MB)\n",
+        valid_samples, total_samples_size, total_samples_size / (1024.0 * 1024.0));
+
+    // 第三步：训练字典
+    uint8_t* dict_buffer = (uint8_t*)malloc(max_dict_size);
+    if (!dict_buffer) {
+        printf("Error: Out of memory for dictionary buffer\n");
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
+
+    printf("Training dictionary (this may take a while)...\n");
+
+    size_t dict_size = ZDICT_trainFromBuffer(
+        dict_buffer, max_dict_size,
+        samples_buffer,       // 单个连续缓冲区
+        sample_sizes,         // 每个样本的大小数组
+        valid_samples         // 样本数量
+    );
+
+    if (ZDICT_isError(dict_size)) {
+        printf("Error: Dictionary training failed: %s\n", ZDICT_getErrorName(dict_size));
+        free(dict_buffer);
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
+
+    // 第四步：保存字典
+    FILE* out = fopen_utf8(output_dict_file, "wb");
+    if (!out) {
+        printf("Error: Cannot create dictionary file: %s\n", output_dict_file);
+        free(dict_buffer);
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
+
+    size_t written = fwrite(dict_buffer, 1, dict_size, out);
+    fclose(out);
+
+    if (written != dict_size) {
+        printf("Error: Failed to write dictionary file (wrote %zu, expected %zu)\n",
+            written, dict_size);
+        free(dict_buffer);
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
+
+    uint32_t dict_id = calculate_dict_id(dict_buffer, dict_size);
+
+    printf("\nDictionary trained successfully:\n");
+    printf("  - Size: %zu bytes (%.2f KB)\n", dict_size, dict_size / 1024.0);
+    printf("  - ID: 0x%08x\n", dict_id);
+    printf("  - Samples used: %d\n", valid_samples);
+    printf("  - Total sample data: %zu bytes (%.2f MB)\n",
+        total_samples_size, total_samples_size / (1024.0 * 1024.0));
+    printf("  - Saved to: %s\n", output_dict_file);
+
+    // 清理
+    free(dict_buffer);
+    free(samples_buffer);
+    free(sample_sizes);
+
+    return 0;
+}
+
 void print_usage(const char* progname) {
     printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression, multi-volume and RS redundancy support)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [--rs <data> <parity>] [--rs-group-size <size>] <directory>   - Create archive\n", progname);
-    printf("  %s extract [-o <output_dir>] [-p <password>] <archive>                  - Extract all files\n", progname);
-    printf("  %s extract [-o <output_dir>] [-p <password>] <archive> <files>          - Extract specific files\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity>] [--rs-group-size <size>] <directory>   - Create archive\n", progname);
+    printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive>                  - Extract all files\n", progname);
+    printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive> <files>          - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
     printf("  %s verify [-p <password>] <archive>                   - Verify archive integrity\n", progname);
+    printf("  %s repair [-o <output>] <archive>                    - Repair corrupted archive\n", progname);
+    printf("  %s train-dict -o <dict_file> [-s <max_size>] <files...>  - Train ZSTD dictionary\n", progname);
     printf("\nOptions:\n");
     printf("  -o, --output <path>        Set output file/directory path\n");
     printf("  -s, --section-size <size>  Set section size (default: 256K)\n");
@@ -4247,29 +4888,57 @@ void print_usage(const char* progname) {
     printf("                              Password can be 16 hex bytes (32 chars) or any string\n");
     printf("  -z, --compress <level>      Set ZSTD compression level (1-22, default: 3)\n");
     printf("                              Use -z 0 to disable compression\n");
+    printf("  -d, --dict <file>           Use ZSTD dictionary for compression/decompression\n");
+    printf("                              Dictionary can be trained with the train-dict command\n");
     printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (data + parity shards)\n");
     printf("  --rs-group-size <size>      Set RS group size (default: 512M)\n");
+    printf("\nDictionary Training:\n");
+    printf("  train-dict -o <dict_file> [-s <max_size>] <files...>\n");
+    printf("      Train a ZSTD dictionary from sample files\n");
+    printf("      -o <dict_file> : Output dictionary file (required)\n");
+    printf("      -s <max_size>  : Maximum dictionary size (default: 128K)\n");
+    printf("                       Supported suffixes: K, M\n");
+    printf("      <files...>     : Training sample files (minimum %d required)\n", MIN_TRAINING_SAMPLES);
+    printf("      Note: For best results, provide samples similar to the data you'll compress.\n");
+    printf("            Total sample size should be ~100x the target dictionary size.\n");
     printf("\nFeatures:\n");
     printf("  - Supports empty directories\n");
     printf("  - Supports empty files (0 bytes)\n");
     printf("  - ZSTD compression (configurable level)\n");
+    printf("  - ZSTD dictionary compression for better ratios on similar data\n");
     printf("  - AES-128 CBC encryption (data only, headers remain unencrypted)\n");
     printf("  - Multi-volume support (automatic splitting, up to %d volumes)\n", MAX_VOLUME_NUMBER);
     printf("  - Reed-Solomon erasure coding for data recovery\n");
     printf("  - Each section uses its header CRC as IV\n");
     printf("\nExamples:\n");
+    printf("  # Basic archive creation\n");
     printf("  %s archive myfolder\n", progname);
     printf("  %s archive -o myarchive.lxar myfolder\n", progname);
     printf("  %s archive -s 1M -v 100M -p mypassword -z 5 -o encrypted_compressed.lxar myfolder\n", progname);
+    printf("\n  # Multi-volume archives\n");
     printf("  %s archive -v 1G myfolder                    # Split into 1GB volumes\n", progname);
     printf("  %s archive -v 4T myfolder                    # Split into 4TB volumes (large archives)\n", progname);
     printf("  %s archive -v 0 myfolder                      # Single file archive (default)\n", progname);
+    printf("\n  # Compression options\n");
     printf("  %s archive -z 0 myfolder                      # Disable compression\n", progname);
+    printf("  %s archive -z 12 myfolder                     # High compression level\n", progname);
+    printf("\n  # Dictionary-based compression\n");
+    printf("  %s train-dict -o mydict.zstd sample1.txt sample2.txt sample3.txt\n", progname);
+    printf("  %s archive -d mydict.zstd -z 12 -o compressed.lxar myfolder\n", progname);
+    printf("  %s extract -d mydict.zstd -p password compressed.lxar\n", progname);
+    printf("\n  # Reed-Solomon redundancy\n");
     printf("  %s archive --rs 10 3 myfolder                 # Add 3 parity blocks for every 10 data blocks\n", progname);
     printf("  %s archive --rs 10 3 --rs-group-size 200M myfolder\n", progname);
+    printf("\n  # Encryption\n");
+    printf("  %s archive -p mypassword myfolder\n", progname);
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
+    printf("\n  # Extraction\n");
     printf("  %s extract -o extracted_files -p mypassword myfolder.lxar\n", progname);
     printf("  %s extract -o output_dir archive.lxar file1.txt file2.txt\n", progname);
+    printf("  %s extract -o output_dir -p pass -d dict.zstd archive.lxar\n", progname);
+    printf("\n  # Verification and repair\n");
+    printf("  %s verify -p mypassword archive.lxar\n", progname);
+    printf("  %s repair -o repaired.lxar corrupted.lxar\n", progname);
     printf("\nMulti-volume naming:\n");
     printf("  Files are named as: basename.001.lxar (1-999)\n");
     printf("                     basename.1000.lxar (1000-9999)\n");
@@ -4295,6 +4964,7 @@ int _main(int argc, char* argv[]) {
         int output_index = -1;
         int compress_index = -1;
         int volume_index = -1;
+        int dict_index = -1;
         int rs_data = -1;
         int rs_parity = -1;
         int rs_group_size_index = -1;
@@ -4328,6 +4998,12 @@ int _main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "-z") == 0 || strcmp(argv[i], "--compress") == 0) {
                 if (i + 1 < argc) {
                     compress_index = i + 1;
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dict") == 0) {
+                if (i + 1 < argc) {
+                    dict_index = i + 1;
                     i++;
                 }
             }
@@ -4375,14 +5051,22 @@ int _main(int argc, char* argv[]) {
             }
         }
 
+        // 处理字典文件
+        if (dict_index != -1) {
+            if (load_dict_from_file(argv[dict_index]) != 0) {
+                printf("Warning: Failed to load dictionary, will use normal compression\n");
+                g_warning_count++;
+            }
+        }
+
         // 处理密码
         if (password_index != -1) {
             generate_key_from_password(argv[password_index]);
         }
+
         // 冗余设置
         if (rs_data > 0 && rs_parity > 0) {
             if (rs_data + rs_parity <= 256) {
-
                 g_rs_enabled = 1;
                 g_rs_data_shards = rs_data;
                 g_rs_parity_shards = rs_parity;
@@ -4398,6 +5082,7 @@ int _main(int argc, char* argv[]) {
             g_rs_group_size = parse_rs_group_size(argv[rs_group_size_index]);
             printf("RS group size: %llu bytes\n", (unsigned long long)g_rs_group_size);
         }
+
         // 找到目录参数
         if (dir_index >= argc) {
             printf("Error: Missing directory name\n");
@@ -4416,15 +5101,24 @@ int _main(int argc, char* argv[]) {
             snprintf(archive_name, sizeof(archive_name), "%s.lxar", get_last_path_component(argv[dir_index]));
         }
 
-        return create_archive(archive_name, argv[dir_index]);
+        int result = create_archive(archive_name, argv[dir_index]);
+
+        // 清理字典上下文
+        if (g_dict_ctx) {
+            free_dict_context(g_dict_ctx);
+            g_dict_ctx = NULL;
+        }
+
+        return result;
     }
     else if (strcmp(argv[1], "extract") == 0 && argc >= 3) {
         // 解析extract命令的参数
         int archive_index = 2;
         int password_index = -1;
         int output_index = -1;
+        int dict_index = -1;
 
-        // 检查是否有-p和-o选项
+        // 检查是否有-p和-o和--dict选项
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--password") == 0) {
                 if (i + 1 < argc) {
@@ -4435,6 +5129,12 @@ int _main(int argc, char* argv[]) {
             else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
                 if (i + 1 < argc) {
                     output_index = i + 1;
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dict") == 0) {
+                if (i + 1 < argc) {
+                    dict_index = i + 1;
                     i++;
                 }
             }
@@ -4449,6 +5149,14 @@ int _main(int argc, char* argv[]) {
             generate_key_from_password(argv[password_index]);
         }
 
+        // 处理字典文件
+        if (dict_index != -1) {
+            if (load_dict_from_file(argv[dict_index]) != 0) {
+                printf("Error: Failed to load dictionary required for extraction\n");
+                return 1;
+            }
+        }
+
         // 处理输出路径
         if (output_index != -1) {
             strncpy(g_output_path, argv[output_index], PATH_LEN_FOR_PROC - 1);
@@ -4457,14 +5165,23 @@ int _main(int argc, char* argv[]) {
             create_directories(g_output_path);
         }
 
+        int result;
         if (archive_index + 1 < argc) {
             // 有指定文件列表
-            return extract_archive(argv[archive_index], &argv[archive_index + 1], argc - archive_index - 1);
+            result = extract_archive(argv[archive_index], &argv[archive_index + 1], argc - archive_index - 1);
         }
         else {
             // 提取所有文件
-            return extract_archive(argv[archive_index], NULL, 0);
+            result = extract_archive(argv[archive_index], NULL, 0);
         }
+
+        // 清理字典上下文
+        if (g_dict_ctx) {
+            free_dict_context(g_dict_ctx);
+            g_dict_ctx = NULL;
+        }
+
+        return result;
     }
     else if (strcmp(argv[1], "list") == 0 && argc >= 3) {
         return list_archive(argv[2]);
@@ -4494,7 +5211,8 @@ int _main(int argc, char* argv[]) {
         }
 
         return verify_archive(argv[archive_index]);
-    }else if (strcmp(argv[1], "repair") == 0 && argc >= 3) {
+    }
+    else if (strcmp(argv[1], "repair") == 0 && argc >= 3) {
         int archive_index = 2;
         int output_index = -1;
 
@@ -4509,7 +5227,6 @@ int _main(int argc, char* argv[]) {
                 archive_index = i;
                 break;
             }
-
         }
 
         if (archive_index >= argc) {
@@ -4528,6 +5245,88 @@ int _main(int argc, char* argv[]) {
         }
 
         return repair_archive(argv[archive_index], repaired_archive_name);
+    }
+    else if (strcmp(argv[1], "train-dict") == 0) {
+        // train-dict命令：训练字典
+        // 用法: lxar train-dict -o <dict_file> [-s <max_size>] <files...>
+
+        int output_index = -1;
+        int size_index = -1;
+        int compress_index = -1;
+        size_t max_dict_size = 128 * 1024; // 默认128KB
+        int file_start = -1;
+
+        // 解析选项
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+                if (i + 1 < argc) {
+                    output_index = i + 1;
+                    i++;
+                }
+            }
+            else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--max-size") == 0) {
+                if (i + 1 < argc) {
+                    size_index = i + 1;
+                    i++;
+                }
+            }
+            else {
+                file_start = i;
+                break;
+            }
+        }
+
+        // 验证必需参数
+        if (output_index == -1) {
+            printf("Error: Missing output file (-o <dict_file>)\n");
+            printf("Usage: %s train-dict -o <dict_file> [-s <max_size>] <files...>\n", argv[0]);
+            return 1;
+        }
+
+        if (file_start == -1 || file_start >= argc) {
+            printf("Error: No training files specified\n");
+            printf("Usage: %s train-dict -o <dict_file> [-s <max_size>] <files...>\n", argv[0]);
+            return 1;
+        }
+
+        // 处理字典大小限制
+        if (size_index != -1) {
+            max_dict_size = parse_size(argv[size_index]);
+            if (max_dict_size > MAX_DICT_SIZE) {
+                printf("Warning: Requested dictionary size %zu exceeds maximum %d, using %d\n",
+                    max_dict_size, MAX_DICT_SIZE, MAX_DICT_SIZE);
+                max_dict_size = MAX_DICT_SIZE;
+            }
+            if (max_dict_size < 1024) {
+                printf("Warning: Requested dictionary size %zu too small, using minimum 1024 bytes\n",
+                    max_dict_size);
+                max_dict_size = 1024;
+            }
+        }
+
+        // 获取文件列表
+        int file_count = argc - file_start;
+
+        printf("=== ZSTD Dictionary Training ===\n");
+        printf("Output file: %s\n", argv[output_index]);
+        printf("Max dictionary size: %zu bytes (%.2f KB)\n", max_dict_size, max_dict_size / 1024.0);
+        printf("Number of training files: %d\n", file_count);
+        printf("================================\n\n");
+
+        // 调用训练函数
+        int result = train_dictionary((const char**)&argv[file_start], file_count,
+            argv[output_index], max_dict_size);
+
+        if (result == 0) {
+            printf("\nDictionary training completed successfully!\n");
+            printf("You can now use it with:\n");
+            printf("  %s archive --dict %s <directory>\n", argv[0], argv[output_index]);
+        }
+        else {
+            printf("\nDictionary training failed!\n");
+        }
+
+        return result;
     }
     else {
         print_usage(argv[0]);
