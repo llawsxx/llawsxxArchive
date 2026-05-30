@@ -4647,6 +4647,10 @@ int train_dictionary(const char** file_list, int file_count,
     printf("  - Files: %d\n", file_count);
     printf("  - Max dictionary size: %zu bytes\n", max_dict_size);
 
+    // 统一限制最大2GB
+    const size_t MAX_TOTAL_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB
+    const size_t MAX_SAMPLE_SIZE = 64 * 1024 * 1024;  // 64MB per sample
+
     // 第一步：获取所有文件大小并计算总大小
     size_t* sample_sizes = (size_t*)malloc(file_count * sizeof(size_t));
 
@@ -4658,10 +4662,6 @@ int train_dictionary(const char** file_list, int file_count,
     size_t total_samples_size = 0;
     int valid_samples = 0;
 
-    // 定义单个样本的最大大小（64MB）
-    const size_t MAX_SAMPLE_SIZE = 64 * 1024 * 1024;
-
-    // 先获取所有文件大小
     printf("Scanning training files...\n");
     for (int i = 0; i < file_count; i++) {
         struct __stat64 st;
@@ -4691,6 +4691,20 @@ int train_dictionary(const char** file_list, int file_count,
         // 限制单个样本大小为64MB（避免内存占用过大）
         size_t sample_size = (size_t)(file_size > MAX_SAMPLE_SIZE ?
             MAX_SAMPLE_SIZE : file_size);
+
+        // 检查是否超过2GB限制
+        if (total_samples_size + sample_size > MAX_TOTAL_SIZE) {
+            printf("Error: Total samples size would exceed 2GB limit\n");
+            printf("  Current: %zu bytes (%.2f MB)\n", total_samples_size,
+                total_samples_size / (1024.0 * 1024.0));
+            printf("  Attempting to add: %zu bytes (%.2f MB)\n", sample_size,
+                sample_size / (1024.0 * 1024.0));
+            printf("  Limit: 2GB\n");
+            printf("Please reduce number of files or use smaller samples.\n");
+            free(sample_sizes);
+            return -1;
+        }
+
         sample_sizes[i] = sample_size;
         total_samples_size += sample_size;
         valid_samples++;
@@ -4709,20 +4723,7 @@ int train_dictionary(const char** file_list, int file_count,
     printf("  - Total samples size: %zu bytes (%.2f MB)\n",
         total_samples_size, total_samples_size / (1024.0 * 1024.0));
 
-    // 检查内存限制（避免分配过大内存）
-    if (total_samples_size > 512 * 1024 * 1024) {
-        printf("Warning: Total samples size %zu exceeds 512MB, this may use a lot of memory\n",
-            total_samples_size);
-        printf("Continue? (y/n): ");
-        char response = getchar();
-        if (response != 'y' && response != 'Y') {
-            printf("Aborted by user\n");
-            free(sample_sizes);
-            return -1;
-        }
-    }
-
-    // 第二步：分配连续缓冲区并加载所有样本
+    // 第二步：分配缓冲区并加载所有样本
     uint8_t* samples_buffer = (uint8_t*)malloc(total_samples_size);
     if (!samples_buffer) {
         printf("Error: Out of memory for samples buffer (%zu bytes, %.2f MB)\n",
@@ -4733,17 +4734,26 @@ int train_dictionary(const char** file_list, int file_count,
 
     size_t offset = 0;
     int loaded_samples = 0;
+    size_t* actual_sizes = (size_t*)malloc(file_count * sizeof(size_t));
+    if (!actual_sizes) {
+        printf("Error: Out of memory\n");
+        free(samples_buffer);
+        free(sample_sizes);
+        return -1;
+    }
 
     printf("Loading samples into memory...\n");
 
     for (int i = 0; i < file_count; i++) {
         if (sample_sizes[i] == 0) {
-            continue;  // 跳过无效样本
+            actual_sizes[loaded_samples] = 0;
+            continue;
         }
 
         FILE* f = fopen_utf8(file_list[i], "rb");
         if (!f) {
             printf("Warning: Cannot open file: %s\n", file_list[i]);
+            actual_sizes[loaded_samples] = 0;
             continue;
         }
 
@@ -4772,26 +4782,26 @@ int train_dictionary(const char** file_list, int file_count,
             // 读取的数据太少，跳过这个样本
             printf("Warning: Too little data read from %s (%zu bytes), skipping\n",
                 file_list[i], file_offset);
-            sample_sizes[loaded_samples] = 0;
+            actual_sizes[loaded_samples] = 0;
             continue;
         }
 
         // 更新实际读取的大小
-        sample_sizes[loaded_samples] = file_offset;
+        actual_sizes[loaded_samples] = file_offset;
 
-        printf("  - [%d] Loaded: %s (%zu bytes)\n", loaded_samples, file_list[i], file_offset);
+        printf("  - [%d] Loaded: %s (%zu bytes)\n", loaded_samples + 1, file_list[i], file_offset);
 
         offset += file_offset;
         loaded_samples++;
     }
 
-    // 更新实际加载的样本数和总大小
     valid_samples = loaded_samples;
     total_samples_size = offset;
 
     if (valid_samples < MIN_TRAINING_SAMPLES) {
         printf("Error: Only %d samples loaded successfully (need %d)\n",
             valid_samples, MIN_TRAINING_SAMPLES);
+        free(actual_sizes);
         free(samples_buffer);
         free(sample_sizes);
         return -1;
@@ -4804,6 +4814,7 @@ int train_dictionary(const char** file_list, int file_count,
     uint8_t* dict_buffer = (uint8_t*)malloc(max_dict_size);
     if (!dict_buffer) {
         printf("Error: Out of memory for dictionary buffer\n");
+        free(actual_sizes);
         free(samples_buffer);
         free(sample_sizes);
         return -1;
@@ -4814,13 +4825,14 @@ int train_dictionary(const char** file_list, int file_count,
     size_t dict_size = ZDICT_trainFromBuffer(
         dict_buffer, max_dict_size,
         samples_buffer,       // 单个连续缓冲区
-        sample_sizes,         // 每个样本的大小数组
+        actual_sizes,         // 每个样本的大小数组
         valid_samples         // 样本数量
     );
 
     if (ZDICT_isError(dict_size)) {
         printf("Error: Dictionary training failed: %s\n", ZDICT_getErrorName(dict_size));
         free(dict_buffer);
+        free(actual_sizes);
         free(samples_buffer);
         free(sample_sizes);
         return -1;
@@ -4831,6 +4843,7 @@ int train_dictionary(const char** file_list, int file_count,
     if (!out) {
         printf("Error: Cannot create dictionary file: %s\n", output_dict_file);
         free(dict_buffer);
+        free(actual_sizes);
         free(samples_buffer);
         free(sample_sizes);
         return -1;
@@ -4843,6 +4856,7 @@ int train_dictionary(const char** file_list, int file_count,
         printf("Error: Failed to write dictionary file (wrote %zu, expected %zu)\n",
             written, dict_size);
         free(dict_buffer);
+        free(actual_sizes);
         free(samples_buffer);
         free(sample_sizes);
         return -1;
@@ -4860,6 +4874,7 @@ int train_dictionary(const char** file_list, int file_count,
 
     // 清理
     free(dict_buffer);
+    free(actual_sizes);
     free(samples_buffer);
     free(sample_sizes);
 
