@@ -4,7 +4,7 @@
  *
  *
  * 使用方法:
- *   lxar archive [-o <输出文件>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] <目录>        - 创建归档
+ *   lxar archive [-o <输出文件>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] <文件或目录>  - 创建归档
  *   lxar extract [-o <输出目录>] [-p <password>] <归档文件>                 - 提取所有文件
  *   lxar extract [-o <输出目录>] [-p <password>] <归档> <文件列表>          - 提取指定文件
  *   lxar list <归档>                        - 列出归档内容
@@ -233,6 +233,7 @@ int g_compression_level = DEFAULT_COMPRESSION_LEVEL;  // 压缩级别
 char g_output_path[PATH_LEN_FOR_PROC] = { 0 }; // 输出路径
 // 添加全局变量来保存输入根路径
 const char* g_input_root_path = NULL;
+int g_single_file_input = 0;
 int g_error_count = 0;           // 错误计数
 int g_warning_count = 0;         // 警告计数
 uint64_t g_current_block_index = 0;   // 当前块索引计数器
@@ -2470,7 +2471,11 @@ void process_file(const char* filepath) {
 
     // 获取相对于输入根目录的路径
     char relative_path[MAX_PATH_LEN] = { 0 };
-    if (get_relative_path(filepath, g_input_root_path, relative_path, sizeof(relative_path)) != 0) {
+    if (g_single_file_input) {
+        strncpy(relative_path, get_last_path_component(filepath), sizeof(relative_path) - 1);
+        relative_path[sizeof(relative_path) - 1] = '\0';
+    }
+    else if (get_relative_path(filepath, g_input_root_path, relative_path, sizeof(relative_path)) != 0) {
         printf("Warning: Path issue for %s\n", filepath);
         g_warning_count++;
         // 继续处理，使用可能不完整的路径
@@ -2710,12 +2715,14 @@ int create_archive(const char* archive_name, const char* input_path) {
     if(g_rs_enabled)
         fec_init();
     int ret = 0;
-    // 检查输入路径是否存在
-    if (!is_directory(input_path)) {
+    // 检查输入路径是否存在，并区分单文件和目录输入
+    struct __stat64 input_stat;
+    if (stat64_utf8(input_path, &input_stat) != 0) {
         printf("Error: Input path does not exist: %s\n", input_path);
         ret = -1;
         goto end;
     }
+    g_single_file_input = (input_stat.st_mode & _S_IFDIR) == 0;
 
     VolumeContext vol_ctx;
     g_vol_ctx = &vol_ctx;  // 设置全局分卷写入上下文指针
@@ -2770,8 +2777,13 @@ int create_archive(const char* archive_name, const char* input_path) {
         printf("Compression: ZSTD level %d enabled\n", g_compression_level);
     }
 
-    // Windows下使用自定义目录遍历，先处理目录，再处理文件
-    walk_directory(input_path, process_file, process_directory);
+    if (g_single_file_input) {
+        process_file(input_path);
+    }
+    else {
+        // Windows下使用自定义目录遍历，先处理目录，再处理文件
+        walk_directory(input_path, process_file, process_directory);
+    }
 
     if (g_rs_enabled && g_group_ctx && g_group_ctx->total_size > 0) {
         //print_data_group_context(g_group_ctx);
@@ -4884,7 +4896,7 @@ int train_dictionary(const char** file_list, int file_count,
 void print_usage(const char* progname) {
     printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression, multi-volume and RS redundancy support)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity>] [--rs-group-size <size>] <directory>   - Create archive\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity>] [--rs-group-size <size>] <file_or_directory>   - Create archive\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive>                  - Extract all files\n", progname);
     printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive> <files>          - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
@@ -4927,6 +4939,7 @@ void print_usage(const char* progname) {
     printf("  - Each section uses its header CRC as IV\n");
     printf("\nExamples:\n");
     printf("  # Basic archive creation\n");
+    printf("  %s archive myfile.txt\n", progname);
     printf("  %s archive myfolder\n", progname);
     printf("  %s archive -o myarchive.lxar myfolder\n", progname);
     printf("  %s archive -s 1M -v 100M -p mypassword -z 5 -o encrypted_compressed.lxar myfolder\n", progname);
@@ -5098,9 +5111,9 @@ int _main(int argc, char* argv[]) {
             printf("RS group size: %llu bytes\n", (unsigned long long)g_rs_group_size);
         }
 
-        // 找到目录参数
+        // 找到输入文件或目录参数
         if (dir_index >= argc) {
-            printf("Error: Missing directory name\n");
+            printf("Error: Missing input file or directory\n");
             print_usage(argv[0]);
             return 1;
         }

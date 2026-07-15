@@ -84,11 +84,11 @@ lxar <command> [options] <arguments>
 ```
 lxar archive [-o <output>] [-s <size>] [-v <size>] [-p <password>]
              [-z <level>] [--rs <data> <parity>]
-             [--rs-group-size <size>] <directory>
+             [--rs-group-size <size>] <file_or_directory>
 ```
 
-Recursively archives the specified directory.  
-递归归档指定目录。
+Archives a single file, or recursively archives the specified directory.
+归档单个文件，或递归归档指定目录。
 
 **Behavior:**
 - Directories are stored as entries (preserving structure).
@@ -187,6 +187,9 @@ Reconstructs a new valid archive using Reed-Solomon parity blocks to recover cor
 ```bash
 # Archive a folder with default settings (ZSTD level 3, no encryption, no splitting)
 lxar archive myfolder
+
+# Archive a single file
+lxar archive document.txt
 
 # Specify output filename
 lxar archive -o myarchive.lxar myfolder
@@ -295,4 +298,3 @@ lxar verify -p mypassword encrypted.lxar
 
 6. **The archive format is big-endian** for all numeric fields, making it portable across architectures.  
    **归档格式所有数值字段均为大端序**，具备跨架构可移植性。
-
