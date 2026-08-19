@@ -31,7 +31,7 @@
 | **AES-128 CBC** | Optional encryption with per-section IV derived from header CRC |
 | **ZSTD compression** | Configurable compression level (1–22), skipped if data grows |
 | **Multi-volume** | Split archives into volumes of any size, up to 99999 volumes |
-| **Reed-Solomon** | Configurable parity shards for erasure recovery |
+| **Reed-Solomon** | GF(2^8), up to 256 total shards |
 | **UTF-8 paths** | Full Unicode filename support on Windows |
 | **CRC32 integrity** | Every section has a CRC32 checksum; headers are separately checksummed |
 
@@ -166,8 +166,8 @@ Reconstructs a new valid archive using Reed-Solomon parity blocks to recover cor
 | `-v`, `--volume-size <size>` | disabled | Split archive into volumes of this size. Range: `4M` – `4T`. Use `0` to disable |
 | `-p`, `--password <password>` | none | Encryption password. Either a plain string (padded/truncated to 16 bytes) or a 32-character hex string (e.g. `00112233445566778899aabbccddeeff`) |
 | `-z`, `--compress <level>` | `3` | ZSTD compression level `1`–`22`. Use `0` to disable compression |
-| `--rs <data> <parity>` | disabled | Enable Reed-Solomon: `data` data shards + `parity` parity shards. Total must be ≤ 256 |
-| `--rs-group-size <size>` | `512M` | Accumulate this much data before emitting an RS group. Range: `1M` – `1024M` |
+| `--rs <data> <parity>` | disabled | Enable Reed-Solomon with GF(2^8). Total shards must not exceed 256. |
+| `--rs-group-size <size>` | `512M` | Accumulate this much data before emitting an RS group. Range: `1M` – `16G`. A shard must remain within 4G. |
 
 ### Size suffixes / 大小后缀
 

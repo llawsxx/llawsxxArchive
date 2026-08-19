@@ -25,12 +25,13 @@
 #include <zstd.h>
 #include <zdict.h>
 #include <errno.h>
+#include <limits.h>
 
 #define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
 #define MIN_SECTION_SIZE (1024)            // 最小1KB
 #define MAX_SECTION_SIZE (64 * 1024 * 1024) // 最大64MB
 #define MIN_RS_GROUP_SIZE (1 * 1024 * 1024) //最小1MB
-#define MAX_RS_GROUP_SIZE (1024 * 1024 * 1024) // 最大1024MB
+#define MAX_RS_GROUP_SIZE (16ULL * 1024 * 1024 * 1024) // 最大16GB
 
 #define DEFAULT_VOLUME_SIZE (0)            // 默认不分卷
 #define MIN_VOLUME_SIZE (4 * 1024 * 1024)  // 最小分卷大小4MB
@@ -48,6 +49,7 @@
 #define FLAG_COMPRESSED 0x02  // 数据已压缩 (ZSTD)
 #define FLAG_RS_REDUNDANT 0x04  // RS冗余块
 #define FLAG_DICT_COMPRESSED 0x08  // 使用ZSTD字典压缩
+#define FLAG_RS_EXTENDED_FIELD 0x10  // 保留给较新RS编码格式；本版本不支持
 
 // 默认压缩级别
 #define DEFAULT_COMPRESSION_LEVEL 3
@@ -183,14 +185,14 @@ typedef struct DataBlock{
 typedef struct {
     DataBlock* front,*rear;
     uint64_t current_block_index;
-    uint32_t total_size;
+    uint64_t total_size;
 } DataGroupContext;
 
 
 typedef struct ReassembledBlock {
     uint64_t block_index;      // 原始block索引
     uint32_t block_offset;   //在Block数据中的偏移
-    uint32_t original_offset;   //在原数据中的偏移
+    uint64_t original_offset;   //在原数据中的偏移
     uint32_t size;              // 重组块的实际大小
     uint32_t crc32;
     struct ReassembledBlock* next;
@@ -199,8 +201,8 @@ typedef struct ReassembledBlock {
 
 typedef struct {
     uint8_t* data;
-    uint32_t total_size;        // 重组数据总大小
-    uint32_t split_size;        // 分割大小
+    uint64_t total_size;        // 重组数据总大小
+    uint64_t split_size;        // 分割大小
     ReassembledBlock* block_info; // 重组块信息链表
     uint32_t block_count;       // 重组块数量
 } ReassembledContext;
@@ -212,6 +214,7 @@ typedef struct {
     uint64_t total_sections;
     uint32_t block_size;
     uint32_t section_size;
+    DataBlock* owner;
     uint8_t* data;
     uint8_t* payload_data;
 } RepairBlockInfo;
@@ -707,7 +710,7 @@ void print_data_group_context(DataGroupContext* context) {
         return;
     }
 
-    printf("DataGroupContext: total_size = %u\n", context->total_size);
+    printf("DataGroupContext: total_size = %llu\n", (unsigned long long)context->total_size);
     printf("DataBlocks:\n");
 
     DataBlock* current = context->front;
@@ -789,7 +792,7 @@ void reset_data_group_context(DataGroupContext* context) {
 }
 
 
-ReassembledBlock* create_reassembled_block(uint64_t block_index, uint32_t block_offset, uint32_t original_offset, uint32_t size, uint32_t crc32) {
+ReassembledBlock* create_reassembled_block(uint64_t block_index, uint32_t block_offset, uint64_t original_offset, uint32_t size, uint32_t crc32) {
     ReassembledBlock* block = (ReassembledBlock*)malloc(sizeof(ReassembledBlock));
     if (block == NULL) {
         return NULL;
@@ -803,12 +806,12 @@ ReassembledBlock* create_reassembled_block(uint64_t block_index, uint32_t block_
     return block;
 }
 
-void add_reassembled_block_info(ReassembledContext* ctx, uint64_t block_index, uint32_t block_offset,
-    uint32_t original_offset, uint32_t size, uint32_t crc32) {
-    if (ctx == NULL) return;
+int add_reassembled_block_info(ReassembledContext* ctx, uint64_t block_index, uint32_t block_offset,
+    uint64_t original_offset, uint32_t size, uint32_t crc32) {
+    if (ctx == NULL) return -1;
 
     ReassembledBlock* new_block = create_reassembled_block(block_index, block_offset, original_offset, size, crc32);
-    if (new_block == NULL) return;
+    if (new_block == NULL) return -1;
 
     if (ctx->block_info == NULL) {
         ctx->block_info = new_block;
@@ -821,33 +824,40 @@ void add_reassembled_block_info(ReassembledContext* ctx, uint64_t block_index, u
         current->next = new_block;
     }
     ctx->block_count++;
+    return 0;
 }
 
-uint32_t round_up_to_multiple(uint32_t x, uint32_t multiple) {
+uint64_t round_up_to_multiple(uint64_t x, uint64_t multiple) {
     return (x + multiple - 1) / multiple * multiple;
 }
 
-ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t split_size) {
+void free_reassembled_info(ReassembledContext* info);
+
+ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint64_t split_size) {
     if (context == NULL || context->front == NULL || split_size == 0) {
         return NULL;
     }
 
     // 计算总数据大小
-    uint32_t total_data_size = context->total_size;
-    uint32_t aligned_total_data_size = round_up_to_multiple(total_data_size, split_size);
+    uint64_t total_data_size = context->total_size;
+    uint64_t aligned_total_data_size = round_up_to_multiple(total_data_size, split_size);
     if (total_data_size == 0) {
+        return NULL;
+    }
+    if (split_size > UINT32_MAX || aligned_total_data_size > SIZE_MAX) {
+        printf("Error: RS group or shard size exceeds supported limits\n");
         return NULL;
     }
 
     // 分配重组后的数据缓冲区，分配aligned_total_data_size的大小，那么后面就可以直接用reassembled_data的指针组data_shards了
-    uint8_t* reassembled_data = (uint8_t*)malloc(aligned_total_data_size);
+    uint8_t* reassembled_data = (uint8_t*)malloc((size_t)aligned_total_data_size);
     if (reassembled_data == NULL) {
         return NULL;
     }
 
     //最后一段需要设0
     if (aligned_total_data_size > total_data_size) {
-        memset(reassembled_data + total_data_size, 0, aligned_total_data_size - total_data_size);
+        memset(reassembled_data + (size_t)total_data_size, 0, (size_t)(aligned_total_data_size - total_data_size));
     }
 
     // 创建重组上下文
@@ -865,12 +875,16 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
     result->block_count = 0;
 
     // 第一步：按顺序拷贝所有数据到重组缓冲区
-    uint32_t current_offset = 0;
+    uint64_t current_offset = 0;
     DataBlock* current_block = context->front;
 
     while (current_block != NULL && current_block->size > 0) {
         if (current_block->data != NULL) {
-            memcpy(reassembled_data + current_offset, current_block->data, current_block->size);
+            memcpy(reassembled_data + (size_t)current_offset, current_block->data, current_block->size);
+            /* The serialized block is already in the archive. Release its
+             * input buffer as soon as it has been copied into RS storage. */
+            free(current_block->data);
+            current_block->data = NULL;
             current_offset += current_block->size;
         }
         current_block = current_block->next;
@@ -879,7 +893,7 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
     // 第二步：构建原始块在重组缓冲区中的位置映射
     typedef struct {
         uint64_t block_index;
-        uint32_t reassembled_offset;  // 在重组缓冲区中的起始偏移
+        uint64_t reassembled_offset;  // 在重组缓冲区中的起始偏移
         uint32_t size;                 // 块大小
     } BlockMapping;
 
@@ -894,6 +908,11 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
     }
 
     // 分配映射数组
+    if (block_count == 0 || block_count > SIZE_MAX / sizeof(BlockMapping)) {
+        free(reassembled_data);
+        free(result);
+        return NULL;
+    }
     BlockMapping* mappings = (BlockMapping*)malloc(sizeof(BlockMapping) * block_count);
     if (mappings == NULL) {
         free(reassembled_data);
@@ -903,7 +922,7 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
 
     // 填充映射信息
     uint32_t mapping_idx = 0;
-    uint32_t offset = 0;
+    uint64_t offset = 0;
     current_block = context->front;
     while (current_block != NULL) {
         if (current_block->size > 0) {
@@ -917,30 +936,35 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
     }
 
     // 第三步：按照分割大小创建重组块，并记录每个重组块对应的原始块信息
-    uint32_t reassembled_offset = 0;
-    uint32_t remaining_data = total_data_size;
+    uint64_t reassembled_offset = 0;
+    uint64_t remaining_data = total_data_size;
 
     while (remaining_data > 0) {
-        uint32_t current_split_size = (remaining_data > split_size) ? split_size : remaining_data;
+        uint32_t current_split_size = (uint32_t)((remaining_data > split_size) ? split_size : remaining_data);
 
         // 计算当前重组块在重组缓冲区中的范围
-        uint32_t segment_start = reassembled_offset;
-        uint32_t segment_end = reassembled_offset + current_split_size - 1;
+        uint64_t segment_start = reassembled_offset;
+        uint64_t segment_end = reassembled_offset + current_split_size - 1;
 
         // 遍历所有原始块，找出与当前重组块有重叠的原始块
         for (uint32_t i = 0; i < block_count; i++) {
-            uint32_t block_start = mappings[i].reassembled_offset;
-            uint32_t block_end = mappings[i].reassembled_offset + mappings[i].size - 1;
+            uint64_t block_start = mappings[i].reassembled_offset;
+            uint64_t block_end = mappings[i].reassembled_offset + mappings[i].size - 1;
 
             // 检查是否有重叠
             if (segment_start >= block_start && segment_start <= block_end) {
                 // 计算在原始块中的偏移
-                uint32_t block_offset = segment_start - block_start;
+                uint32_t block_offset = (uint32_t)(segment_start - block_start);
 
-                uint32_t crc32 = crc32_calc(reassembled_data + segment_start, current_split_size);
+                uint32_t crc32 = crc32_calc(reassembled_data + (size_t)segment_start, current_split_size);
                 // 记录重组块信息
-                add_reassembled_block_info(result, mappings[i].block_index, block_offset,
-                    segment_start, current_split_size, crc32);
+                if (add_reassembled_block_info(result, mappings[i].block_index, block_offset,
+                    (uint64_t)segment_start, current_split_size, crc32) != 0) {
+                    printf("Error: Out of memory for RS shard metadata\n");
+                    free(mappings);
+                    free_reassembled_info(result);
+                    return NULL;
+                }
             }
         }
 
@@ -954,13 +978,13 @@ ReassembledContext* reassemble_data_by_size(DataGroupContext* context, uint32_t 
 
 // 计算切割大小（根据总大小和切割份数）
 // 返回每个切割块的大小（最后一块可能小于这个大小）
-uint32_t calculate_split_size_by_count(uint32_t total_size, uint32_t split_count) {
+uint64_t calculate_split_size_by_count(uint64_t total_size, uint32_t split_count) {
     if (split_count == 0) {
         return 0;
     }
 
     // 计算基础切割大小
-    uint32_t base_size = (total_size + split_count - 1) / split_count;
+    uint64_t base_size = (total_size + split_count - 1) / split_count;
     return base_size;
 }
 
@@ -971,13 +995,13 @@ ReassembledContext* reassemble_data_by_count(DataGroupContext* context, uint32_t
     }
 
     // 计算总数据大小
-    uint32_t total_data_size = context->total_size;
+    uint64_t total_data_size = context->total_size;
     if (total_data_size == 0) {
         return NULL;
     }
 
     // 根据总大小和切割份数计算切割大小
-    uint32_t split_size = calculate_split_size_by_count(total_data_size, split_count);
+    uint64_t split_size = calculate_split_size_by_count(total_data_size, split_count);
 
     // 调用按大小切割的函数
     return reassemble_data_by_size(context, split_size);
@@ -994,8 +1018,8 @@ void print_reassembled_info(ReassembledContext* ctx) {
     printf("╔══════════════════════════════════════════════════════════════════╗\n");
     printf("║                        Reassembled Data Info                      ║\n");
     printf("╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Total size: %-10u bytes    Split size: %-10u bytes    ║\n",
-        ctx->total_size, ctx->split_size);
+    printf("║ Total size: %-10llu bytes    Split size: %-10llu bytes    ║\n",
+        (unsigned long long)ctx->total_size, (unsigned long long)ctx->split_size);
     printf("║ Reassembled block count: %-10u                                    ║\n",
         ctx->block_count);
     printf("╚══════════════════════════════════════════════════════════════════╝\n");
@@ -1009,9 +1033,9 @@ void print_reassembled_info(ReassembledContext* ctx) {
 
         int ref_index = 0;
         while (current != NULL) {
-            printf("│   [%d] block_index=%-8llu block offset=%-8u offset=%-8u size=%-8u    │\n",
+            printf("│   [%d] block_index=%-8llu block offset=%-8u offset=%-8llu size=%-8u    │\n",
                 ref_index, (unsigned long long)current->block_index , current->block_offset,
-                current->original_offset, current->size);
+                (unsigned long long)current->original_offset, current->size);
             current = current->next;
             ref_index++;
         }
@@ -1271,7 +1295,11 @@ size_t archive_write(const void* ptr, size_t size, int next_volume_if_needed,int
 
     if (!is_write_rs && g_rs_enabled && g_group_ctx) {
         int ret = write_to_data_block(g_group_ctx, g_group_ctx->current_block_index, ptr, (uint32_t)size);
-        if (ret < 0) return ret;
+        if (ret < 0) {
+            printf("Error: Failed to buffer data for RS group (error %d)\n", ret);
+            g_error_count++;
+            return 0;
+        }
     }
 
     if (g_vol_ctx->is_multi_volume) {
@@ -1327,6 +1355,7 @@ size_t write_crc32(uint32_t crc,int is_write_rs) {
         printf("Writing RS data group %llu\n", g_current_block_group_index);
         if (rs_group_reassemble_and_write(g_group_ctx, g_rs_parity_shards, g_current_block_group_index, g_rs_data_shards) < 0) {
             printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
+            g_error_count++;
         }
 
         reset_data_group_context(g_group_ctx);
@@ -1355,7 +1384,12 @@ size_t write_block_header(BlockHeader* header,int is_write_rs) {
 
     if (!is_write_rs && g_rs_enabled && g_group_ctx) {
         int ret = init_data_block(g_group_ctx, header->block_id, header->section_size + sizeof(BlockHeader) + CRC32_SIZE);
-        if (ret < 0) return ret;
+        if (ret < 0) {
+            printf("Error: Failed to allocate RS buffer for block %llu (error %d)\n",
+                (unsigned long long)header->block_id, ret);
+            g_error_count++;
+            return 0;
+        }
     }
     header_host_to_be(header, &be_header);
     uint32_t crc = crc32_calc(&be_header, sizeof(BlockHeader) - 4);
@@ -1901,7 +1935,7 @@ uint32_t parse_section_size(const char* size_str) {
 }
 
 // 解析rs size参数
-uint32_t parse_rs_group_size(const char* size_str) {
+uint64_t parse_rs_group_size(const char* size_str) {
     uint64_t size = parse_size(size_str);
 
     // 检查范围
@@ -1911,11 +1945,11 @@ uint32_t parse_rs_group_size(const char* size_str) {
         size = MIN_RS_GROUP_SIZE;
     }
     else if (size > MAX_RS_GROUP_SIZE) {
-        printf("Warning: RS group size too large (%llu bytes), using maximum %d bytes\n",
-            size, MAX_RS_GROUP_SIZE);
+        printf("Warning: RS group size too large (%llu bytes), using maximum %llu bytes\n",
+            (unsigned long long)size, (unsigned long long)MAX_RS_GROUP_SIZE);
         size = MAX_RS_GROUP_SIZE;
     }
-    return (uint32_t)size;
+    return size;
 }
 
 
@@ -2712,8 +2746,9 @@ void process_file(const char* filepath) {
 
 // 创建归档文件（支持分卷）
 int create_archive(const char* archive_name, const char* input_path) {
-    if(g_rs_enabled)
+    if(g_rs_enabled) {
         fec_init();
+    }
     int ret = 0;
     // 检查输入路径是否存在，并区分单文件和目录输入
     struct __stat64 input_stat;
@@ -2791,6 +2826,7 @@ int create_archive(const char* archive_name, const char* input_path) {
         printf("Writing RS data group %llu\n", g_current_block_group_index);
         if (rs_group_reassemble_and_write(g_group_ctx, g_rs_parity_shards, g_current_block_group_index, g_rs_data_shards) < 0) {
             printf("Error: Writing RS data group %llu failed\n", g_current_block_group_index);
+            g_error_count++;
         }
 
         reset_data_group_context(g_group_ctx);
@@ -3845,15 +3881,16 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
     ReassembledContext* split_info = reassemble_data_by_count(group_ctx, split_count);
     if (!split_info) return -1;
 
-    uint32_t max_block_size = split_info->split_size;
+    uint32_t max_block_size = (uint32_t)split_info->split_size;
     ReassembledBlock* current = split_info->block_info;
     int data_shards_count = split_info->block_count;
+    int total_shards_count = data_shards_count + parity_shards_count;
 
     // 初始化指针
     fec_t* code = NULL;
     uint8_t** data_shards = NULL;
     uint8_t** parity_shards = NULL;
-    unsigned int* blocknums = NULL;
+    uint32_t* blocknums = NULL;
     uint8_t* rs_data = NULL;
     int ret = -1;
 
@@ -3881,14 +3918,19 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
         }
     }
 
-    // 创建RS编码器
-    code = fec_new(data_shards_count, data_shards_count + parity_shards_count);
-    if (!code) {
-        ret = -1;
+    if (data_shards_count <= 0 || parity_shards_count <= 0 ||
+        total_shards_count > 256) {
+        printf("Error: RS total shard count must be between 1 and 256\n");
         goto cleanup;
     }
 
-    blocknums = malloc(sizeof(unsigned int) * parity_shards_count);
+    code = fec_new((unsigned short)data_shards_count, (unsigned short)total_shards_count);
+    if (!code) {
+        printf("Error: Failed to create GF(2^8) RS encoder\n");
+        goto cleanup;
+    }
+
+    blocknums = malloc(sizeof(uint32_t) * parity_shards_count);
 
     if (!blocknums) {
         ret = -1;
@@ -3896,11 +3938,12 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
     }
 
     for (int i = 0; i < parity_shards_count; i++) {
-        blocknums[i] = (unsigned int)(i + data_shards_count);
+        blocknums[i] = (uint32_t)(i + data_shards_count);
     }
 
     // 执行编码
-    fec_encode(code, data_shards, parity_shards, blocknums, parity_shards_count, max_block_size);
+    fec_encode(code, (const gf* const*)data_shards, (gf* const*)parity_shards,
+        (const unsigned int*)blocknums, parity_shards_count, max_block_size);
 
     // 计算并写入RS冗余块
     uint64_t total_section_count = parity_shards_count;
@@ -3997,7 +4040,6 @@ cleanup:
     if (code) {
         fec_free(code);
     }
-
     if (blocknums) {
         free(blocknums);
     }
@@ -4027,6 +4069,7 @@ cleanup:
 // 解析RS块信息（从内存中解析）
 int parse_rs_block_info(uint8_t* rs_data, size_t rs_size, RSDataChunkInfo** chunks,
     int* chunk_count, uint32_t* shard_size) {
+    size_t metadata_size;
     if (rs_size < sizeof(RSBlockHeader)) {
         return -1;
     }
@@ -4039,6 +4082,14 @@ int parse_rs_block_info(uint8_t* rs_data, size_t rs_size, RSDataChunkInfo** chun
     if (header.chunk_info_size != sizeof(RSDataChunkInfo)) {
         return -1;
     }
+    if (header.chunk_count == 0 || header.chunk_count > INT_MAX ||
+        header.chunk_count > (SIZE_MAX - sizeof(RSBlockHeader)) / sizeof(RSDataChunkInfo)) {
+        return -1;
+    }
+    metadata_size = sizeof(RSBlockHeader) + (size_t)header.chunk_count * sizeof(RSDataChunkInfo);
+    if (metadata_size > rs_size || header.data_size > rs_size - metadata_size) {
+        return -1;
+    }
 
     *chunk_count = header.chunk_count;
     *shard_size = header.data_size;
@@ -4048,7 +4099,7 @@ int parse_rs_block_info(uint8_t* rs_data, size_t rs_size, RSDataChunkInfo** chun
     }
 
     uint8_t* ptr = rs_data + sizeof(RSBlockHeader);
-    for (int i = 0; i < header.chunk_count; i++) {
+    for (uint32_t i = 0; i < header.chunk_count; i++) {
         RSDataChunkInfo info_be;
         memcpy(&info_be, ptr, sizeof(RSDataChunkInfo));
         rs_data_chunk_info_be_to_host(&info_be, &(*chunks)[i]);
@@ -4065,6 +4116,7 @@ typedef struct {
     int data_shards_count;      // 数据分片数量
     int parity_shards_count;    // 校验分片数量
     uint32_t shard_size;        // 每个分片的大小
+    uint8_t* data_storage;      // contiguous storage for all data shards
     RSDataChunkInfo* chunks;    // 分片信息
     int chunk_count;            // 分片信息数量
 } RSShardsInfo;
@@ -4074,10 +4126,15 @@ void free_rs_shards_info(RSShardsInfo* rs_info) {
     int nr_shards = rs_info->data_shards_count + rs_info->parity_shards_count;
     if (rs_info->shards) {
         for (int i = 0; i < nr_shards; i++) {
-            if (rs_info->shards[i]) free(rs_info->shards[i]);
+            if (rs_info->shards[i] &&
+                (!rs_info->data_storage || i >= rs_info->data_shards_count)) {
+                free(rs_info->shards[i]);
+            }
         }
         free(rs_info->shards);
     }
+
+    free(rs_info->data_storage);
 
     if (rs_info->marks) {
         free(rs_info->marks);
@@ -4120,6 +4177,10 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
 
             // 检查是否是RS冗余块
             if (header.flags & FLAG_RS_REDUNDANT) {
+                if (header.flags & FLAG_RS_EXTENDED_FIELD) {
+                    printf("Unsupported RS encoding format in this archive\n");
+                    goto cleanup;
+                }
                 // 扩展RS块数组
                 if (rs_block_count >= rs_block_capacity) {
                     rs_block_capacity = rs_block_capacity ? rs_block_capacity * 2 : 4;
@@ -4136,6 +4197,7 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
                 rs_blocks[rs_block_count].block_size = current->size;
                 rs_blocks[rs_block_count].section_id = header.section_id;
                 rs_blocks[rs_block_count].section_size = header.section_size;
+                rs_blocks[rs_block_count].owner = current;
                 rs_blocks[rs_block_count].total_sections = header.total_section_count;
                 rs_blocks[rs_block_count].data = current->data;
                 rs_blocks[rs_block_count].payload_data = current->data + sizeof(BlockHeader);
@@ -4159,6 +4221,7 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
                 data_blocks[data_block_count].total_sections = header.total_section_count;
                 data_blocks[data_block_count].block_size = current->size;
                 data_blocks[data_block_count].section_size = header.section_size;
+                data_blocks[data_block_count].owner = current;
                 data_blocks[data_block_count].data = current->data;
                 data_blocks[data_block_count].payload_data = current->data + sizeof(BlockHeader);
                 data_block_count++;
@@ -4185,6 +4248,12 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
     // 第三步：准备分片数组
     int data_shards_count = chunk_count;
     uint64_t parity_shards_count = rs_blocks[0].total_sections;
+
+    if (data_shards_count <= 0 || parity_shards_count == 0 ||
+        data_shards_count > 256 || parity_shards_count > 256 - (uint64_t)data_shards_count) {
+        printf("Invalid RS shard metadata\n");
+        goto cleanup;
+    }
     nr_shards = data_shards_count + (int)parity_shards_count;
 
     shards = (uint8_t**)calloc(nr_shards, sizeof(uint8_t*));
@@ -4195,47 +4264,67 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         goto cleanup;
     }
 
-    // 初始化所有分片缓冲区
-    for (int i = 0; i < nr_shards; i++) {
-        shards[i] = (uint8_t*)calloc(shard_size, 1);
-        if (!shards[i]) {
-            printf("Out of memory for shard %d\n", i);
-            goto cleanup;
-        }
-    }
-
     for (int i = 0; i < nr_shards; i++) {
         marks[i] = 1;
     }
 
-    // 第四步：从数据块中填充数据分片
-    for (int i = 0; i < chunk_count; i++) {
-        for (int j = 0; j < data_block_count; j++) {
-            RepairBlockInfo* block = &data_blocks[j];
-            if (chunks[i].block_index == block->block_id) {
-                uint32_t remaining = chunks[i].size;
-                uint32_t offset = chunks[i].offset;
-                uint32_t shard_offset = 0;
-                int j2 = j;
-                while (remaining > 0 && j2 < data_block_count) {
-                    block = &data_blocks[j2];
-                    uint32_t read_size = remaining > block->block_size - offset ? block->block_size - offset : remaining;
-                    memcpy(shards[i] + shard_offset, block->data + offset, read_size);
-                    remaining -= read_size;
-                    shard_offset += read_size;
-                    j2++;
-                    offset = 0;
-                }
-                uint32_t crc32 = crc32_calc(shards[i], chunks[i].size);
-                if (crc32 == chunks[i].crc32) {
-                    marks[i] = 0;
-                }
-                break;
+    /* Data blocks are already in archive order. Copy them into one contiguous
+     * data-shard buffer and release each source block immediately. */
+    if ((size_t)data_shards_count > SIZE_MAX / shard_size) {
+        printf("Out of memory for data shards\n");
+        goto cleanup;
+    }
+    rs_info->data_storage = (uint8_t*)malloc((size_t)data_shards_count * shard_size);
+    if (!rs_info->data_storage) {
+        printf("Out of memory for data shards\n");
+        goto cleanup;
+    }
+    for (int i = 0; i < data_shards_count; i++) {
+        shards[i] = rs_info->data_storage + (size_t)i * shard_size;
+    }
+
+    /* Allocate every parity shard before releasing any source block. If this
+     * fails, the fallback path can still write the untouched group data. */
+    for (int i = 0; i < rs_block_count; i++) {
+        if (rs_blocks[i].section_id >= parity_shards_count) {
+            continue;
+        }
+        int shard_index = (int)rs_blocks[i].section_id + data_shards_count;
+        if (!shards[shard_index]) {
+            shards[shard_index] = (uint8_t*)calloc(shard_size, 1);
+            if (!shards[shard_index]) {
+                printf("Out of memory for parity shard %llu\n", rs_blocks[i].section_id);
+                goto cleanup;
             }
         }
     }
 
-    // 第五步：从RS块中填充校验分片
+    size_t data_offset = 0;
+    size_t data_capacity = (size_t)data_shards_count * shard_size;
+    for (int i = 0; i < data_block_count; i++) {
+        RepairBlockInfo* block = &data_blocks[i];
+        if (block->block_size > data_capacity - data_offset) {
+            printf("Data blocks exceed RS shard capacity\n");
+            goto cleanup;
+        }
+        memcpy(rs_info->data_storage + data_offset, block->data, block->block_size);
+        data_offset += block->block_size;
+        free(block->owner->data);
+        block->owner->data = NULL;
+    }
+    if (data_offset < data_capacity) {
+        memset(rs_info->data_storage + data_offset, 0, data_capacity - data_offset);
+    }
+
+    // 验证数据分片
+    for (int i = 0; i < chunk_count; i++) {
+        uint32_t crc32 = crc32_calc(shards[i], chunks[i].size);
+        if (crc32 == chunks[i].crc32) {
+            marks[i] = 0;
+        }
+    }
+
+    // 从RS块中填充校验分片
     for (int i = 0; i < rs_block_count; i++) {
         RepairBlockInfo* rs_block = &rs_blocks[i];
         if (rs_block->section_id >= parity_shards_count) {
@@ -4248,13 +4337,16 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         uint32_t rs_data_size = rs_block->section_size - (sizeof(RSBlockHeader) +
             chunk_count * sizeof(RSDataChunkInfo));
 
+        int shard_index = (int)rs_block->section_id + data_shards_count;
         if (rs_data_size >= shard_size) {
-            memcpy(shards[(int)rs_block->section_id + data_shards_count], rs_data_start, shard_size);
-            marks[(int)rs_block->section_id + data_shards_count] = 0;
+            memcpy(shards[shard_index], rs_data_start, shard_size);
+            marks[shard_index] = 0;
         }
         else {
             printf("  Warning: RS block %llu has insufficient data\n", rs_block->block_id);
         }
+        free(rs_block->owner->data);
+        rs_block->owner->data = NULL;
     }
 
 
@@ -4264,6 +4356,8 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
     rs_info->data_shards_count = data_shards_count;
     rs_info->parity_shards_count = (int)parity_shards_count;
     rs_info->shard_size = shard_size;
+    /* data_storage owns all data shard pointers; parity shards are owned
+     * individually by the shard array. */
     rs_info->chunks = chunks;
     rs_info->chunk_count = chunk_count;
 
@@ -4276,10 +4370,13 @@ cleanup:
     if (shards) {
         // 清理已分配的分片
         for (int i = 0; i < nr_shards; i++) {
-            if (shards[i]) free(shards[i]);
+            if (shards[i] && (!rs_info->data_storage || i >= data_shards_count)) {
+                free(shards[i]);
+            }
         }
         free(shards);
     }
+    free(rs_info->data_storage);
     if (marks) 
         free(marks);
     if(chunks)
@@ -4294,7 +4391,7 @@ cleanup:
 int fec_reconstruct(fec_t* code,
     unsigned char** shards,
     unsigned char* marks,
-    int block_size)
+    uint32_t block_size)
 {
     int i;
     int k, n;
@@ -4303,7 +4400,7 @@ int fec_reconstruct(fec_t* code,
     unsigned char** inpkts = NULL;
     unsigned char** outpkts = NULL;
     int ret = 0;
-    if (!code || !shards || !marks || block_size <= 0) {
+    if (!code || !shards || !marks || block_size == 0) {
         return -1;
     }
 
@@ -4363,7 +4460,6 @@ end:
     return ret;
 }
 
-
 // 恢复group
 int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
     if (!group_ctx) {
@@ -4373,17 +4469,18 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
     int ret = 0;
     if (extract_rs_shards_from_group(group_ctx, &rs_info) != 0) {
         DataBlock* current = group_ctx->front;
+        printf("Error: Failed to prepare RS shards; writing original group data without repair\n");
         while (current != NULL) {
             if (current->data && current->size > 0) {
                 size_t written = archive_write(current->data, current->size, 0, 0);
                 if (written != current->size) {
-                    printf("  Warning: Failed to write block id %llu (size=%u)\n",current->block_index, current->size);
-                    ret = -1;
+                    printf("  Warning: Failed to write block id %llu (size=%u)\n",
+                        (unsigned long long)current->block_index, current->size);
                 }
             }
             current = current->next;
         }
-        return ret;
+        return -1;
     }
 
     // 创建RS解码器
@@ -4399,23 +4496,23 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
     }
 
     if (is_corrupted) {
-        fec_t *code = fec_new(rs_info.data_shards_count, total_shards);
-        if (code) {
-            // 执行RS解码
-            printf("Reconstructing missing chunks\n");
-            int decode_result = fec_reconstruct(code, rs_info.shards, rs_info.marks, rs_info.shard_size);
-            if (decode_result == 0) {
-                printf("RS reconstruction successful!\n");
+        int decode_result = -1;
+        printf("Reconstructing missing chunks with GF(2^8)\n");
+        if (total_shards <= 256) {
+            fec_t* code = fec_new((unsigned short)rs_info.data_shards_count, (unsigned short)total_shards);
+            if (code) {
+                decode_result = fec_reconstruct(code, rs_info.shards, rs_info.marks, rs_info.shard_size);
+                fec_free(code);
             }
-            else {
-                printf("RS reconstruction failed with error code: %d\n", decode_result);
-                ret = -1;
-            }
-            fec_free(code);
+        }
+
+        if (decode_result == 0) {
+            printf("RS reconstruction successful!\n");
         }
         else {
-            printf("Failed to create RS decoder\n");
+            printf("RS reconstruction failed\n");
             ret = -1;
+            printf("Writing unrepaired data shards for best-effort output\n");
         }
         
     }
@@ -4549,9 +4646,10 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                 }
             }
             else {
-                printf("Warning: Out of memory for block %llu\n",
+                printf("Error: Out of memory reading block %llu; repair aborted\n",
                     (unsigned long long)header.block_id);
-                block_available = 0;
+                ret = -1;
+                goto cleanup;
             }
         }
         else if (header.magic == MAGIC_NUMBER_FILE && header.section_size == 0) {
@@ -4604,15 +4702,25 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                     reset_data_group_context(group_ctx);
                 }
                 if (init_data_block(group_ctx, header.block_id, header.section_size + sizeof(BlockHeader) + CRC32_SIZE) >= 0) {
-                    //TODO 一次写入？
-                    write_to_data_block(group_ctx, group_ctx->current_block_index, (uint8_t*)&raw_header, sizeof(BlockHeader));
+                    int buffer_result = write_to_data_block(group_ctx, group_ctx->current_block_index,
+                        (uint8_t*)&raw_header, sizeof(BlockHeader));
                     if (data_buffer) {
-                        write_to_data_block(group_ctx, group_ctx->current_block_index,
+                        buffer_result |= write_to_data_block(group_ctx, group_ctx->current_block_index,
                             data_buffer, header.section_size);
                     }
                     // 写入CRC
-                    write_to_data_block(group_ctx, group_ctx->current_block_index,
+                    buffer_result |= write_to_data_block(group_ctx, group_ctx->current_block_index,
                         (uint8_t*)&stored_raw_crc, CRC32_SIZE);
+                    if (buffer_result < 0) {
+                        printf("Error: Failed to buffer block %llu for RS repair\n",
+                            (unsigned long long)header.block_id);
+                        ret = -1;
+                    }
+                }
+                else {
+                    printf("Error: Out of memory buffering block %llu for RS repair\n",
+                        (unsigned long long)header.block_id);
+                    ret = -1;
                 }
                 last_group_id = header.block_group_id;
             }
@@ -4917,8 +5025,8 @@ void print_usage(const char* progname) {
     printf("                              Use -z 0 to disable compression\n");
     printf("  -d, --dict <file>           Use ZSTD dictionary for compression/decompression\n");
     printf("                              Dictionary can be trained with the train-dict command\n");
-    printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (data + parity shards)\n");
-    printf("  --rs-group-size <size>      Set RS group size (default: 512M)\n");
+    printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (up to 256 total shards; GF(2^8))\n");
+    printf("  --rs-group-size <size>      Set RS group size (default: 512M, maximum: 16G)\n");
     printf("\nDictionary Training:\n");
     printf("  train-dict -o <dict_file> [-s <max_size>] <files...>\n");
     printf("      Train a ZSTD dictionary from sample files\n");
@@ -5094,15 +5202,18 @@ int _main(int argc, char* argv[]) {
 
         // 冗余设置
         if (rs_data > 0 && rs_parity > 0) {
-            if (rs_data + rs_parity <= 256) {
+            uint64_t total_rs_shards = (uint64_t)(unsigned int)rs_data + (uint64_t)(unsigned int)rs_parity;
+            if (total_rs_shards <= 256) {
                 g_rs_enabled = 1;
                 g_rs_data_shards = rs_data;
                 g_rs_parity_shards = rs_parity;
                 g_current_block_group_index = 1;
-                printf("RS redundancy enabled: %d data shards, %d parity shards\n", rs_data, rs_parity);
+                printf("RS redundancy enabled: %d data shards, %d parity shards (GF(2^8))\n",
+                    rs_data, rs_parity);
             }
             else {
-                printf("RS redundancy not enabled: %d data shards + %d parity shards larger than 256\n", rs_data, rs_parity);
+                printf("RS redundancy not enabled: %d data shards + %d parity shards larger than 256\n",
+                    rs_data, rs_parity);
             }
         }
 
