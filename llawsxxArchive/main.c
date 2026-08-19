@@ -4460,9 +4460,20 @@ end:
     return ret;
 }
 
+typedef int (*RecoveredDataSink)(const uint8_t* data, size_t size, void* context);
+
+int recovered_archive_write_sink(const uint8_t* data, size_t size, void* context) {
+    (void)context;
+    return archive_write(data, size, 0, 0) == size ? 0 : -1;
+}
+
 // 恢复group
-int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
+int recover_group_with_rs(DataGroupContext* group_ctx,
+    RecoveredDataSink sink, void* sink_context) {
     if (!group_ctx) {
+        return -1;
+    }
+    if (!sink) {
         return -1;
     }
     RSShardsInfo rs_info;
@@ -4472,8 +4483,10 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
         printf("Error: Failed to prepare RS shards; writing original group data without repair\n");
         while (current != NULL) {
             if (current->data && current->size > 0) {
-                size_t written = archive_write(current->data, current->size, 0, 0);
-                if (written != current->size) {
+                BlockHeader header;
+                header_be_to_host((BlockHeader*)current->data, &header);
+                if (!(header.flags & FLAG_RS_REDUNDANT) &&
+                    sink(current->data, current->size, sink_context) != 0) {
                     printf("  Warning: Failed to write block id %llu (size=%u)\n",
                         (unsigned long long)current->block_index, current->size);
                 }
@@ -4519,8 +4532,7 @@ int recover_group_with_rs_and_write(DataGroupContext* group_ctx) {
 
     for (int i = 0; i < rs_info.data_shards_count; i++) {
         uint32_t size = rs_info.chunks[i].size;
-        size_t written = archive_write(rs_info.shards[i], size, 0, 0);
-        if (written != size) {
+        if (sink(rs_info.shards[i], size, sink_context) != 0) {
             printf("  Warning: Failed to write shards (size=%u)\n", size);
             ret = -1;
         }
@@ -4696,7 +4708,7 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                 if (header.block_group_id != last_group_id) {
                     //print_data_group_context(group_ctx);
                     printf("Processing group index %llu\n", last_group_id);
-                    if (recover_group_with_rs_and_write(group_ctx) < 0) {
+                    if (recover_group_with_rs(group_ctx, recovered_archive_write_sink, NULL) < 0) {
                         ret = -1;
                     }
                     reset_data_group_context(group_ctx);
@@ -4734,7 +4746,7 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
     }
     if (last_group_id != (uint64_t)-1 && group_ctx->total_size > 0) {
         printf("Processing group index %llu\n", last_group_id);
-        if (recover_group_with_rs_and_write(group_ctx) < 0) {
+        if (recover_group_with_rs(group_ctx, recovered_archive_write_sink, NULL) < 0) {
             ret = -1;
         }
         reset_data_group_context(group_ctx);
@@ -4751,6 +4763,556 @@ cleanup:
         volume_close(g_vol_ctx);
         g_vol_ctx = NULL;
     }
+    return ret;
+}
+
+typedef struct {
+    ExtractingFile* files;
+    int file_count;
+    int file_capacity;
+    int extract_all;
+    int extracted_count;
+    int corrupted_files;
+    int file_not_found;
+    int total_files;
+    int total_dirs;
+    int ret;
+} RepairedExtractContext;
+
+typedef enum {
+    REPAIRED_PARSE_HEADER,
+    REPAIRED_PARSE_DATA,
+    REPAIRED_PARSE_CRC
+} RepairedParseState;
+
+typedef struct {
+    RepairedExtractContext* extract_context;
+    RepairedParseState state;
+    uint8_t raw_header[sizeof(BlockHeader)];
+    size_t header_used;
+    BlockHeader header;
+    uint8_t* data;
+    uint32_t data_used;
+    uint8_t raw_crc[CRC32_SIZE];
+    size_t crc_used;
+    int error;
+} RepairedArchiveParser;
+
+int repaired_extract_add_file(RepairedExtractContext* context, const char* filename) {
+    if (context->file_count >= context->file_capacity) {
+        int new_capacity = context->file_capacity ? context->file_capacity * 2 : 16;
+        ExtractingFile* files = (ExtractingFile*)realloc(context->files,
+            (size_t)new_capacity * sizeof(ExtractingFile));
+        if (!files) {
+            return -1;
+        }
+        context->files = files;
+        memset(&context->files[context->file_capacity], 0,
+            (size_t)(new_capacity - context->file_capacity) * sizeof(ExtractingFile));
+        context->file_capacity = new_capacity;
+    }
+
+    ExtractingFile* file = &context->files[context->file_count];
+    strncpy(file->filename, filename, MAX_PATH_LEN - 1);
+    file->filename[MAX_PATH_LEN - 1] = '\0';
+    file->found = 1;
+    return context->file_count++;
+}
+
+int repaired_extract_select_file(RepairedExtractContext* context, const char* filename,
+    int* file_index) {
+    *file_index = -1;
+    for (int i = 0; i < context->file_count; ++i) {
+        if (strcmp(context->files[i].filename, filename) == 0) {
+            context->files[i].found = 1;
+            *file_index = i;
+            return 1;
+        }
+    }
+
+    if (!context->extract_all) {
+        return 0;
+    }
+
+    *file_index = repaired_extract_add_file(context, filename);
+    return *file_index >= 0 ? 1 : -1;
+}
+
+int repaired_extract_open_file(RepairedExtractContext* context, int file_index,
+    const BlockHeader* header) {
+    ExtractingFile* file = &context->files[file_index];
+    if (file->outfile) {
+        return 0;
+    }
+
+    char output_file_path[PATH_LEN_FOR_PROC];
+    build_output_path(g_output_path, header->filename, output_file_path, sizeof(output_file_path));
+    char* dir_path = strdup(output_file_path);
+    if (!dir_path) {
+        return -1;
+    }
+    char* dir = dirname(dir_path);
+    if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
+        create_directories(dir);
+    }
+    free(dir_path);
+
+    printf("Extracting: %s", header->filename);
+    if (header->flags & FLAG_ENCRYPTED) printf(" (encrypted)");
+    if (header->flags & FLAG_COMPRESSED) printf(" (compressed)");
+    printf("\n");
+
+    file->outfile = fopen_utf8(output_file_path, "wb");
+    if (!file->outfile) {
+        printf("Error: Cannot create file %s\n", output_file_path);
+        return -1;
+    }
+
+    context->total_files++;
+    file->expected_size = header->total_size;
+    file->current_size = 0;
+    file->expected_section_id = 0;
+    file->total_sections = header->total_section_count;
+    file->is_encrypted = (header->flags & FLAG_ENCRYPTED) != 0;
+    file->is_compressed = (header->flags & FLAG_COMPRESSED) != 0;
+    file->corrupted = 0;
+    progress_init(&file->progress, header->total_size, header->total_section_count,
+        header->filename);
+    return 0;
+}
+
+int repaired_extract_complete_file(RepairedExtractContext* context, ExtractingFile* file) {
+    progress_finish(&file->progress);
+    fclose(file->outfile);
+    file->outfile = NULL;
+
+    if (file->corrupted) {
+        char original_path[PATH_LEN_FOR_PROC];
+        char corrupted_path[PATH_LEN_FOR_PROC];
+        build_output_path(g_output_path, file->filename, original_path, sizeof(original_path));
+        snprintf(corrupted_path, sizeof(corrupted_path), "%s.corrupted", original_path);
+        printf("File %s corrupted, rename to %s\n", file->filename, corrupted_path);
+        if (rename(original_path, corrupted_path) != 0) {
+            printf("File %s rename to %s failed\n", file->filename, corrupted_path);
+        }
+        context->corrupted_files++;
+        context->ret = -1;
+    }
+    else {
+        context->extracted_count++;
+        printf("Successfully extracted: %s (%llu bytes)\n", file->filename,
+            (unsigned long long)file->expected_size);
+    }
+    return 0;
+}
+
+int repaired_extract_process_block(RepairedExtractContext* context,
+    const uint8_t* raw_header, uint8_t* data, uint32_t stored_raw_crc) {
+    BlockHeader header;
+    header_be_to_host((const BlockHeader*)raw_header, &header);
+    uint32_t stored_crc = be32toh(stored_raw_crc);
+
+    if (header.magic == MAGIC_NUMBER_DIR) {
+        context->total_dirs++;
+        if (stored_crc != 0) {
+            printf("Warning: Directory %s has non-zero CRC 0x%08x\n", header.filename, stored_crc);
+            context->ret = -1;
+        }
+        if (context->extract_all) {
+            char dir_path[MAX_PATH_LEN];
+            strncpy(dir_path, header.filename, sizeof(dir_path) - 1);
+            dir_path[sizeof(dir_path) - 1] = '\0';
+            size_t len = strlen(dir_path);
+            if (len > 0 && dir_path[len - 1] == '/') {
+                dir_path[len - 1] = '\0';
+            }
+            if (dir_path[0]) {
+                create_directories_with_root(g_output_path, dir_path);
+            }
+        }
+        free(data);
+        return 0;
+    }
+
+    if (header.magic != MAGIC_NUMBER_FILE || (header.flags & FLAG_RS_REDUNDANT)) {
+        free(data);
+        return 0;
+    }
+
+    int file_index;
+    int selected = repaired_extract_select_file(context, header.filename, &file_index);
+    if (selected < 0) {
+        free(data);
+        return -1;
+    }
+    if (!selected) {
+        free(data);
+        return 0;
+    }
+    if (repaired_extract_open_file(context, file_index, &header) != 0) {
+        free(data);
+        return -1;
+    }
+
+    ExtractingFile* file = &context->files[file_index];
+    if (header.section_id != file->expected_section_id) {
+        printf("Warning: File '%s' section id mismatch: expected %llu, found %llu\n",
+            file->filename, (unsigned long long)file->expected_section_id,
+            (unsigned long long)header.section_id);
+        file->corrupted = 1;
+    }
+    if (header.data_offset != file->current_size) {
+        printf("Warning: File '%s' data offset mismatch: expected %llu, found %llu\n",
+            file->filename, (unsigned long long)file->current_size,
+            (unsigned long long)header.data_offset);
+        file->corrupted = 1;
+        if (_fseeki64(file->outfile, header.data_offset, SEEK_SET) == 0) {
+            file->current_size = header.data_offset;
+        }
+    }
+
+    uint32_t original_len = header.original_size;
+    uint32_t data_len = header.section_size;
+    if (data_len > 0) {
+        uint32_t crc = crc32_calc(data, data_len);
+        if (header.flags & FLAG_ENCRYPTED) {
+            if (!g_encryption_enabled) {
+                printf("Error: The file is encrypted, but no password provided\n");
+                file->corrupted = 1;
+            }
+            else if (data_len % AES_BLOCK_SIZE != 0) {
+                printf("Error: Invalid encrypted section size for %s\n", file->filename);
+                file->corrupted = 1;
+            }
+            else {
+                process_data_block(data, data_len, header.header_crc32, 0);
+                uint32_t unpadded_len;
+                if (pkcs7_unpad(data, data_len, &unpadded_len) < 0) {
+                    printf("Error: PKCS#7 unpad failed\n");
+                    file->corrupted = 1;
+                }
+                else {
+                    data_len = unpadded_len;
+                }
+            }
+        }
+
+        uint8_t* final_data = data;
+        uint32_t final_len = data_len;
+        if (header.flags & FLAG_COMPRESSED) {
+            int has_dict = (header.flags & FLAG_DICT_COMPRESSED) != 0;
+            uint8_t* decompressed = decompress_zstd_with_dict(data, data_len, original_len, has_dict);
+            if (!decompressed) {
+                printf("Error: Decompression failed for %s section id %llu\n", file->filename,
+                    (unsigned long long)header.section_id);
+                file->corrupted = 1;
+            }
+            else {
+                free(data);
+                final_data = decompressed;
+                final_len = original_len;
+            }
+        }
+
+        size_t write_len = final_len > original_len ? original_len : final_len;
+        if (fwrite(final_data, 1, write_len, file->outfile) != write_len) {
+            printf("Error: Failed to write data for %s section id %llu\n", file->filename,
+                (unsigned long long)header.section_id);
+            free(final_data);
+            return -1;
+        }
+        if (write_len < original_len &&
+            _fseeki64(file->outfile, original_len - write_len, SEEK_CUR) != 0) {
+            printf("Error: Failed to seek output file %s\n", file->filename);
+            free(final_data);
+            return -1;
+        }
+        free(final_data);
+
+        if (crc != stored_crc) {
+            printf("Error: File %s section id %llu CRC check failed\n", file->filename,
+                (unsigned long long)header.section_id);
+            file->corrupted = 1;
+        }
+        file->current_size += original_len;
+        file->expected_section_id = header.section_id + 1;
+        progress_update(&file->progress, file->current_size, header.section_id, 0);
+    }
+    else {
+        free(data);
+        if (stored_crc != 0) {
+            printf("Warning: Empty file %s has non-zero CRC 0x%08x\n", file->filename, stored_crc);
+            file->corrupted = 1;
+        }
+    }
+
+    if (file->current_size >= file->expected_size) {
+        return repaired_extract_complete_file(context, file);
+    }
+    return 0;
+}
+
+int repaired_parser_process_block(RepairedArchiveParser* parser) {
+    uint32_t raw_crc;
+    memcpy(&raw_crc, parser->raw_crc, sizeof(raw_crc));
+    int ret = repaired_extract_process_block(parser->extract_context, parser->raw_header,
+        parser->data, raw_crc);
+    parser->data = NULL;
+    parser->data_used = 0;
+    parser->header_used = 0;
+    parser->crc_used = 0;
+    parser->state = REPAIRED_PARSE_HEADER;
+    return ret;
+}
+
+int repaired_parser_feed(RepairedArchiveParser* parser, const uint8_t* data, size_t size) {
+    while (size > 0) {
+        if (parser->state == REPAIRED_PARSE_HEADER) {
+            size_t copy_size = sizeof(BlockHeader) - parser->header_used;
+            if (copy_size > size) copy_size = size;
+            memcpy(parser->raw_header + parser->header_used, data, copy_size);
+            parser->header_used += copy_size;
+            data += copy_size;
+            size -= copy_size;
+            if (parser->header_used != sizeof(BlockHeader)) continue;
+
+            header_be_to_host((const BlockHeader*)parser->raw_header, &parser->header);
+            if ((parser->header.magic != MAGIC_NUMBER_FILE && parser->header.magic != MAGIC_NUMBER_DIR) ||
+                parser->header.section_size > MAX_SECTION_SIZE) {
+                printf("Error: Recovered stream contains an invalid block header\n");
+                parser->error = -1;
+                return -1;
+            }
+            parser->data_used = 0;
+            parser->crc_used = 0;
+            if (parser->header.section_size == 0) {
+                parser->state = REPAIRED_PARSE_CRC;
+            }
+            else {
+                parser->data = (uint8_t*)malloc(parser->header.section_size);
+                if (!parser->data) {
+                    printf("Error: Out of memory for recovered block data\n");
+                    parser->error = -1;
+                    return -1;
+                }
+                parser->state = REPAIRED_PARSE_DATA;
+            }
+        }
+        else if (parser->state == REPAIRED_PARSE_DATA) {
+            size_t copy_size = parser->header.section_size - parser->data_used;
+            if (copy_size > size) copy_size = size;
+            memcpy(parser->data + parser->data_used, data, copy_size);
+            parser->data_used += (uint32_t)copy_size;
+            data += copy_size;
+            size -= copy_size;
+            if (parser->data_used == parser->header.section_size) {
+                parser->state = REPAIRED_PARSE_CRC;
+            }
+        }
+        else {
+            size_t copy_size = CRC32_SIZE - parser->crc_used;
+            if (copy_size > size) copy_size = size;
+            memcpy(parser->raw_crc + parser->crc_used, data, copy_size);
+            parser->crc_used += copy_size;
+            data += copy_size;
+            size -= copy_size;
+            if (parser->crc_used == CRC32_SIZE && repaired_parser_process_block(parser) != 0) {
+                parser->error = -1;
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int repaired_parser_sink(const uint8_t* data, size_t size, void* context) {
+    return repaired_parser_feed((RepairedArchiveParser*)context, data, size);
+}
+
+int repaired_extract_init(RepairedExtractContext* context, char** files, int file_count) {
+    memset(context, 0, sizeof(*context));
+    context->extract_all = file_count == 0;
+    if (context->extract_all) {
+        printf("Extracting all files with RS recovery\n");
+        return 0;
+    }
+
+    context->files = (ExtractingFile*)calloc(file_count, sizeof(ExtractingFile));
+    if (!context->files) {
+        return -1;
+    }
+    context->file_count = file_count;
+    context->file_capacity = file_count;
+    printf("Extracting selected files with RS recovery:\n");
+    for (int i = 0; i < file_count; ++i) {
+        strncpy(context->files[i].filename, files[i], MAX_PATH_LEN - 1);
+        context->files[i].filename[MAX_PATH_LEN - 1] = '\0';
+        printf("  %s\n", context->files[i].filename);
+    }
+    return 0;
+}
+
+int repaired_extract_finish(RepairedExtractContext* context) {
+    for (int i = 0; i < context->file_count; ++i) {
+        ExtractingFile* file = &context->files[i];
+        if (file->outfile) {
+            fclose(file->outfile);
+            file->outfile = NULL;
+            file->corrupted = 1;
+            context->corrupted_files++;
+            context->ret = -1;
+        }
+        if (!context->extract_all && !file->found) {
+            printf("Warning: File '%s' not found in archive\n", file->filename);
+            context->file_not_found++;
+            context->ret = -1;
+        }
+    }
+
+    printf("\nExtraction summary:\n");
+    printf("  - Total file in archive: %d\n", context->total_files);
+    printf("  - Total directory in archive: %d\n", context->total_dirs);
+    printf("  - Successfully extracted: %d\n", context->extracted_count);
+    printf("  - Corrupted files: %d\n", context->corrupted_files);
+    int ret = context->ret;
+    free(context->files);
+    context->files = NULL;
+    return ret;
+}
+
+int extract_archive_with_repair(const char* archive_name, char** files, int file_count) {
+    VolumeReadContext vol_ctx;
+    DataGroupContext* group_ctx = NULL;
+    RepairedExtractContext extract_context;
+    RepairedArchiveParser parser;
+    int ret = 0;
+
+    if (repaired_extract_init(&extract_context, files, file_count) != 0) {
+        printf("Error: Out of memory preparing extraction\n");
+        return -1;
+    }
+    if (g_output_path[0] != '\0') {
+        printf("Output directory: %s\n", g_output_path);
+        create_directories(g_output_path);
+    }
+    memset(&parser, 0, sizeof(parser));
+    parser.extract_context = &extract_context;
+    parser.state = REPAIRED_PARSE_HEADER;
+    fec_init();
+
+    if (volume_read_init(&vol_ctx, archive_name) != 0) goto cleanup;
+    g_vol_read_ctx = &vol_ctx;
+    group_ctx = init_data_group_context();
+    if (!group_ctx) goto cleanup;
+
+    printf("Scanning archive and recovering RS groups directly into extracted files...\n");
+    long long start_pos = 0;
+    long long filesize = vol_ctx.file_size;
+    uint64_t block_num = 0;
+    uint64_t last_group_id = (uint64_t)-1;
+
+    while (1) {
+        long long pos = find_next_magic(vol_ctx.file, start_pos, filesize);
+        if (pos == -1) {
+            if (volume_read_next(&vol_ctx) != 0) break;
+            start_pos = 0;
+            filesize = vol_ctx.file_size;
+            continue;
+        }
+
+        BlockHeader header;
+        BlockHeader raw_header;
+        if (!read_block_header(&header, &raw_header)) {
+            start_pos = pos + 1;
+            continue;
+        }
+        validate_block_header(&header, pos, start_pos, &block_num);
+
+        uint8_t* data = NULL;
+        uint32_t stored_crc = 0;
+        uint32_t stored_raw_crc = 0;
+        int block_available = 1;
+        if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
+            data = (uint8_t*)malloc(header.section_size);
+            if (!data) {
+                printf("Error: Out of memory reading block %llu\n", (unsigned long long)header.block_id);
+                goto cleanup;
+            }
+            size_t actual_read = archive_read(data, header.section_size);
+            if (actual_read != header.section_size) {
+                printf("Warning: Short read for block %llu\n", (unsigned long long)header.block_id);
+                memset(data + actual_read, 0, header.section_size - actual_read);
+                if (header.flags & FLAG_RS_REDUNDANT) block_available = 0;
+            }
+            read_crc32(&stored_crc, &stored_raw_crc);
+            if (crc32_calc(data, header.section_size) != stored_crc &&
+                (header.flags & FLAG_RS_REDUNDANT)) {
+                block_available = 0;
+            }
+        }
+        else {
+            read_crc32(&stored_crc, &stored_raw_crc);
+        }
+
+        if (header.block_group_id != 0 && last_group_id != (uint64_t)-1 &&
+            header.block_group_id != last_group_id) {
+            printf("Processing group index %llu\n", (unsigned long long)last_group_id);
+            if (recover_group_with_rs(group_ctx, repaired_parser_sink, &parser) != 0) ret = -1;
+            reset_data_group_context(group_ctx);
+        }
+
+        if (header.block_group_id == 0) {
+            if (repaired_parser_feed(&parser, (const uint8_t*)&raw_header, sizeof(raw_header)) != 0 ||
+                (data && repaired_parser_feed(&parser, data, header.section_size) != 0) ||
+                repaired_parser_feed(&parser, (const uint8_t*)&stored_raw_crc, CRC32_SIZE) != 0) {
+                free(data);
+                goto cleanup;
+            }
+            free(data);
+            data = NULL;
+        }
+        else if (block_available) {
+            if (init_data_block(group_ctx, header.block_id,
+                header.section_size + sizeof(BlockHeader) + CRC32_SIZE) < 0 ||
+                write_to_data_block(group_ctx, group_ctx->current_block_index,
+                    (const uint8_t*)&raw_header, sizeof(raw_header)) < 0 ||
+                (data && write_to_data_block(group_ctx, group_ctx->current_block_index,
+                    data, header.section_size) < 0) ||
+                write_to_data_block(group_ctx, group_ctx->current_block_index,
+                    (const uint8_t*)&stored_raw_crc, CRC32_SIZE) < 0) {
+                printf("Error: Failed to buffer block %llu for RS recovery\n",
+                    (unsigned long long)header.block_id);
+                free(data);
+                goto cleanup;
+            }
+            last_group_id = header.block_group_id;
+            free(data);
+            data = NULL;
+        }
+        else {
+            free(data);
+            data = NULL;
+        }
+        start_pos = archive_tell();
+    }
+
+    if (last_group_id != (uint64_t)-1 && group_ctx->total_size > 0) {
+        printf("Processing group index %llu\n", (unsigned long long)last_group_id);
+        if (recover_group_with_rs(group_ctx, repaired_parser_sink, &parser) != 0) ret = -1;
+    }
+    if (parser.error || parser.state != REPAIRED_PARSE_HEADER || parser.header_used != 0) {
+        printf("Error: Recovered stream ended with an incomplete block\n");
+        ret = -1;
+    }
+
+cleanup:
+    free(parser.data);
+    if (group_ctx) free_data_group_context(group_ctx);
+    if (g_vol_read_ctx) {
+        volume_read_close(g_vol_read_ctx);
+        g_vol_read_ctx = NULL;
+    }
+    if (repaired_extract_finish(&extract_context) != 0) ret = -1;
     return ret;
 }
 
@@ -5005,8 +5567,8 @@ void print_usage(const char* progname) {
     printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression, multi-volume and RS redundancy support)\n");
     printf("Usage:\n");
     printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity>] [--rs-group-size <size>] <file_or_directory>   - Create archive\n", progname);
-    printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive>                  - Extract all files\n", progname);
-    printf("  %s extract [-o <output_dir>] [-p <password>] [-d <dict>] <archive> <files>          - Extract specific files\n", progname);
+    printf("  %s extract [--repair] [-o <output_dir>] [-p <password>] [-d <dict>] <archive>       - Extract all files\n", progname);
+    printf("  %s extract [--repair] [-o <output_dir>] [-p <password>] [-d <dict>] <archive> <files> - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
     printf("  %s verify [-p <password>] <archive>                   - Verify archive integrity\n", progname);
     printf("  %s repair [-o <output>] <archive>                    - Repair corrupted archive\n", progname);
@@ -5025,6 +5587,7 @@ void print_usage(const char* progname) {
     printf("                              Use -z 0 to disable compression\n");
     printf("  -d, --dict <file>           Use ZSTD dictionary for compression/decompression\n");
     printf("                              Dictionary can be trained with the train-dict command\n");
+    printf("  --repair                     Recover RS groups while extracting; no repaired archive is created\n");
     printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (up to 256 total shards; GF(2^8))\n");
     printf("  --rs-group-size <size>      Set RS group size (default: 512M, maximum: 16G)\n");
     printf("\nDictionary Training:\n");
@@ -5070,6 +5633,7 @@ void print_usage(const char* progname) {
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
     printf("\n  # Extraction\n");
     printf("  %s extract -o extracted_files -p mypassword myfolder.lxar\n", progname);
+    printf("  %s extract --repair -o restored damaged.lxar\n", progname);
     printf("  %s extract -o output_dir archive.lxar file1.txt file2.txt\n", progname);
     printf("  %s extract -o output_dir -p pass -d dict.zstd archive.lxar\n", progname);
     printf("\n  # Verification and repair\n");
@@ -5256,6 +5820,7 @@ int _main(int argc, char* argv[]) {
         int password_index = -1;
         int output_index = -1;
         int dict_index = -1;
+        int repair_while_extracting = 0;
 
         // 检查是否有-p和-o和--dict选项
         for (int i = 2; i < argc; i++) {
@@ -5276,6 +5841,9 @@ int _main(int argc, char* argv[]) {
                     dict_index = i + 1;
                     i++;
                 }
+            }
+            else if (strcmp(argv[i], "--repair") == 0) {
+                repair_while_extracting = 1;
             }
             else {
                 archive_index = i;
@@ -5305,7 +5873,12 @@ int _main(int argc, char* argv[]) {
         }
 
         int result;
-        if (archive_index + 1 < argc) {
+        if (repair_while_extracting) {
+            result = extract_archive_with_repair(argv[archive_index],
+                archive_index + 1 < argc ? &argv[archive_index + 1] : NULL,
+                argc - archive_index - 1);
+        }
+        else if (archive_index + 1 < argc) {
             // 有指定文件列表
             result = extract_archive(argv[archive_index], &argv[archive_index + 1], argc - archive_index - 1);
         }

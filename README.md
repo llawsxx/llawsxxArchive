@@ -101,7 +101,7 @@ Archives a single file, or recursively archives the specified directory.
 ### extract / 提取文件
 
 ```
-lxar extract [-o <output_dir>] [-p <password>] <archive> [file1 file2 ...]
+lxar extract [--repair] [-o <output_dir>] [-p <password>] <archive> [file1 file2 ...]
 ```
 
 Extract all files, or only the specified files from the archive.  
@@ -110,6 +110,7 @@ Extract all files, or only the specified files from the archive.
 - If no file list is given, all files are extracted.
 - Paths inside the archive use forward slashes (`/`). Specify them accordingly when extracting individual files.
 - Corrupted files are renamed to `<filename>.corrupted` rather than silently discarded.
+- `--repair` reconstructs damaged RS groups while extracting, without creating an intermediate repaired archive.
 
 ---
 
@@ -168,6 +169,7 @@ Reconstructs a new valid archive using Reed-Solomon parity blocks to recover cor
 | `-z`, `--compress <level>` | `3` | ZSTD compression level `1`–`22`. Use `0` to disable compression |
 | `--rs <data> <parity>` | disabled | Enable Reed-Solomon with GF(2^8). Total shards must not exceed 256. |
 | `--rs-group-size <size>` | `512M` | Accumulate this much data before emitting an RS group. Range: `1M` – `16G`. A shard must remain within 4G. |
+| `--repair` | disabled | With `extract`, reconstruct damaged RS groups directly into extracted files. Requires RS redundancy. |
 
 ### Size suffixes / 大小后缀
 
@@ -216,6 +218,9 @@ lxar archive -p 00112233445566778899aabbccddeeff -o encrypted.lxar myfolder
 
 # Extract with password
 lxar extract -p "my secret password" -o output_dir encrypted.lxar
+
+# Repair RS-protected data directly while extracting
+lxar extract --repair -o restored damaged.lxar
 ```
 
 ### Multi-volume / 分卷
