@@ -4268,13 +4268,15 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         marks[i] = 1;
     }
 
-    /* Data blocks are already in archive order. Copy them into one contiguous
-     * data-shard buffer and release each source block immediately. */
+    /* Rebuild each data shard from the block identified by its RS metadata.
+     * If bytes were deleted from the archive, a whole block may be absent;
+     * packing the remaining blocks sequentially would shift every later shard. */
     if ((size_t)data_shards_count > SIZE_MAX / shard_size) {
         printf("Out of memory for data shards\n");
         goto cleanup;
     }
-    rs_info->data_storage = (uint8_t*)malloc((size_t)data_shards_count * shard_size);
+    /* RS encodes the unused tail of a short final shard as zeroes. */
+    rs_info->data_storage = (uint8_t*)calloc((size_t)data_shards_count, shard_size);
     if (!rs_info->data_storage) {
         printf("Out of memory for data shards\n");
         goto cleanup;
@@ -4299,29 +4301,45 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         }
     }
 
-    size_t data_offset = 0;
-    size_t data_capacity = (size_t)data_shards_count * shard_size;
-    for (int i = 0; i < data_block_count; i++) {
-        RepairBlockInfo* block = &data_blocks[i];
-        if (block->block_size > data_capacity - data_offset) {
-            printf("Data blocks exceed RS shard capacity\n");
-            goto cleanup;
+    for (int i = 0; i < chunk_count; i++) {
+        RSDataChunkInfo* chunk = &chunks[i];
+        int start_block = -1;
+        for (int j = 0; j < data_block_count; j++) {
+            if (data_blocks[j].block_id == chunk->block_index) {
+                start_block = j;
+                break;
+            }
         }
-        memcpy(rs_info->data_storage + data_offset, block->data, block->block_size);
-        data_offset += block->block_size;
-        free(block->owner->data);
-        block->owner->data = NULL;
-    }
-    if (data_offset < data_capacity) {
-        memset(rs_info->data_storage + data_offset, 0, data_capacity - data_offset);
+
+        if (start_block >= 0) {
+            uint32_t remaining = chunk->size;
+            uint32_t source_offset = chunk->offset;
+            uint32_t shard_offset = 0;
+            for (int j = start_block; remaining > 0 && j < data_block_count; j++) {
+                RepairBlockInfo* block = &data_blocks[j];
+                if (source_offset > block->block_size) {
+                    break;
+                }
+                uint32_t available = block->block_size - source_offset;
+                uint32_t copy_size = remaining < available ? remaining : available;
+                if (copy_size == 0) {
+                    break;
+                }
+                memcpy(shards[i] + shard_offset, block->data + source_offset, copy_size);
+                remaining -= copy_size;
+                shard_offset += copy_size;
+                source_offset = 0;
+            }
+            if (remaining == 0 && crc32_calc(shards[i], chunk->size) == chunk->crc32) {
+                marks[i] = 0;
+            }
+        }
     }
 
-    // 验证数据分片
-    for (int i = 0; i < chunk_count; i++) {
-        uint32_t crc32 = crc32_calc(shards[i], chunks[i].size);
-        if (crc32 == chunks[i].crc32) {
-            marks[i] = 0;
-        }
+    /* The contiguous shard storage now owns the only data-shard copy. */
+    for (int i = 0; i < data_block_count; i++) {
+        free(data_blocks[i].owner->data);
+        data_blocks[i].owner->data = NULL;
     }
 
     // 从RS块中填充校验分片
@@ -4519,6 +4537,16 @@ int recover_group_with_rs(DataGroupContext* group_ctx,
             }
         }
 
+        if (decode_result == 0) {
+            for (int i = 0; i < rs_info.data_shards_count; i++) {
+                if (rs_info.marks[i] &&
+                    crc32_calc(rs_info.shards[i], rs_info.chunks[i].size) != rs_info.chunks[i].crc32) {
+                    printf("RS reconstruction produced an invalid data shard %d\n", i);
+                    decode_result = -1;
+                    break;
+                }
+            }
+        }
         if (decode_result == 0) {
             printf("RS reconstruction successful!\n");
         }
