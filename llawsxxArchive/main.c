@@ -4670,6 +4670,10 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
             continue;
         }
 
+        // 保存块起点。若块长度或数据已损坏，当前游标可能已经越过后续块，
+        // 需要从该起点后一字节重新搜索，而不是从错误的游标继续扫描。
+        long long block_start_pos = pos;
+
         // 读取块头
         if (!read_block_header(&header,&raw_header)) {
             printf("Warning: Failed to read block header at position %lld\n", pos);
@@ -4693,6 +4697,7 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
         uint32_t stored_raw_crc = 0;
         uint8_t* data_buffer = NULL;
         uint32_t data_len = header.section_size;
+        int need_resync = 0;
 
         if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
             // 读取数据
@@ -4702,8 +4707,8 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                 if (actual_read != data_len) {
                     printf("Warning: Short read for block %llu (expected %u, got %zu)\n",
                         (unsigned long long)header.block_id, data_len, actual_read);
-                    if(header.flags & FLAG_RS_REDUNDANT) //冗余块不允许损坏
-                        block_available = 0;
+                    block_available = 0;
+                    need_resync = 1;
                 }
                 else {
                     // 计算CRC
@@ -4713,17 +4718,18 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                     uint32_t calc_crc = crc32_final(&crc_ctx);
 
                     // 读取存储的CRC
-                    read_crc32(&stored_crc,&stored_raw_crc);
+                    if (!read_crc32(&stored_crc,&stored_raw_crc)) {
+                        block_available = 0;
+                        need_resync = 1;
+                    }
 
                     if (calc_crc != stored_crc) {
                         printf("Warning: CRC mismatch for block %llu (group %llu): calc=0x%08x, stored=0x%08x\n",
                             (unsigned long long)header.block_id,
                             (unsigned long long)header.block_group_id,
                             calc_crc, stored_crc);
-                        //有可能只坏了部分，重组shards的时候会再计算一次CRC，可能这个block整体数据不正确，但部分数据是正确的
-                        //所以不标记block_corrupted（但冗余块不允许损坏）
-                        if (header.flags & FLAG_RS_REDUNDANT)
-                            block_available = 0;
+                        block_available = 0;
+                        need_resync = 1;
                     }
                 }
             }
@@ -4736,7 +4742,10 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
         }
         else if (header.magic == MAGIC_NUMBER_FILE && header.section_size == 0) {
             // 空文件，只读取CRC
-            read_crc32(&stored_crc, &stored_raw_crc);
+            if (!read_crc32(&stored_crc, &stored_raw_crc)) {
+                block_available = 0;
+                need_resync = 1;
+            }
             if (stored_crc != 0) {
                 printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
                     header.filename, stored_crc);
@@ -4744,11 +4753,28 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
         }
         else if (header.magic == MAGIC_NUMBER_DIR) {
             // 目录块，只读取CRC
-            read_crc32(&stored_crc, &stored_raw_crc);
+            if (!read_crc32(&stored_crc, &stored_raw_crc)) {
+                block_available = 0;
+                need_resync = 1;
+            }
             if (stored_crc != 0) {
                 printf("Warning: Directory %s has non-zero CRC 0x%08x\n",
                     header.filename, stored_crc);
             }
+        }
+
+        if (need_resync) {
+            if (data_buffer) {
+                free(data_buffer);
+                data_buffer = NULL;
+            }
+            // 从当前块起点后一字节开始找，允许在损坏块内容中重新发现真实 header。
+            start_pos = block_start_pos + 1;
+            printf("Resyncing after corrupted block %llu (group %llu) from position 0x%llx\n",
+                (unsigned long long)header.block_id,
+                (unsigned long long)header.block_group_id,
+                (unsigned long long)start_pos);
+            continue;
         }
 
         if (block_available) {
@@ -5223,6 +5249,8 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
             continue;
         }
 
+        long long block_start_pos = pos;
+
         BlockHeader header;
         BlockHeader raw_header;
         if (!read_block_header(&header, &raw_header)) {
@@ -5235,6 +5263,7 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
         uint32_t stored_crc = 0;
         uint32_t stored_raw_crc = 0;
         int block_available = 1;
+        int need_resync = 0;
         if (header.magic == MAGIC_NUMBER_FILE && header.section_size > 0) {
             data = (uint8_t*)malloc(header.section_size);
             if (!data) {
@@ -5245,16 +5274,34 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
             if (actual_read != header.section_size) {
                 printf("Warning: Short read for block %llu\n", (unsigned long long)header.block_id);
                 memset(data + actual_read, 0, header.section_size - actual_read);
-                if (header.flags & FLAG_RS_REDUNDANT) block_available = 0;
-            }
-            read_crc32(&stored_crc, &stored_raw_crc);
-            if (crc32_calc(data, header.section_size) != stored_crc &&
-                (header.flags & FLAG_RS_REDUNDANT)) {
                 block_available = 0;
+                need_resync = 1;
+            }
+            if (!read_crc32(&stored_crc, &stored_raw_crc)) {
+                block_available = 0;
+                need_resync = 1;
+            }
+            if (crc32_calc(data, header.section_size) != stored_crc) {
+                block_available = 0;
+                need_resync = 1;
             }
         }
         else {
-            read_crc32(&stored_crc, &stored_raw_crc);
+            if (!read_crc32(&stored_crc, &stored_raw_crc)) {
+                block_available = 0;
+                need_resync = 1;
+            }
+        }
+
+        if (need_resync) {
+            free(data);
+            data = NULL;
+            start_pos = block_start_pos + 1;
+            printf("Resyncing after corrupted block %llu (group %llu) from position 0x%llx\n",
+                (unsigned long long)header.block_id,
+                (unsigned long long)header.block_group_id,
+                (unsigned long long)start_pos);
+            continue;
         }
 
         if (header.block_group_id != 0 && last_group_id != (uint64_t)-1 &&
