@@ -26,6 +26,7 @@
 #include <zdict.h>
 #include <errno.h>
 #include <limits.h>
+#include <wchar.h>
 
 #define DEFAULT_SECTION_SIZE (256 * 1024)  // 默认256KB
 #define MIN_SECTION_SIZE (1024)            // 最小1KB
@@ -315,6 +316,25 @@ FILE* fopen_utf8(const char* filename, const char* mode) {
     free(wfilename);
     free(wmode);
     return fp;
+}
+
+int rename_utf8(const char* old_path, const char* new_path) {
+    wchar_t* old_wpath = utf8_to_utf16(old_path);
+    wchar_t* new_wpath = utf8_to_utf16(new_path);
+
+    if (!old_wpath || !new_wpath) {
+        free(old_wpath);
+        free(new_wpath);
+        errno = EINVAL;
+        return -1;
+    }
+
+    int result = _wrename(old_wpath, new_wpath);
+    int saved_errno = errno;
+    free(old_wpath);
+    free(new_wpath);
+    errno = saved_errno;
+    return result;
 }
 
 int stat64_utf8(const char* path, struct _stat64* buffer) {
@@ -3518,7 +3538,7 @@ static int extracting_file_complete(ExtractingFile* file, int* extracted_count,
         build_output_path(g_output_path, file->filename, original_path, sizeof(original_path));
         snprintf(corrupted_path, sizeof(corrupted_path), "%s.corrupted", original_path);
         printf("File %s corrupted, rename to %s\n", file->filename, corrupted_path);
-        if (rename(original_path, corrupted_path) != 0) {
+        if (rename_utf8(original_path, corrupted_path) != 0) {
             printf("File %s rename to %s failed\n", file->filename, corrupted_path);
         }
         (*corrupted_files)++;
@@ -3816,7 +3836,7 @@ cleanup:
                     extracting_files[i].expected_size,
                     extracting_files[i].current_size, new_file_name
                 );
-                if (rename(original_path, new_file_name) != 0) {
+                if (rename_utf8(original_path, new_file_name) != 0) {
                     printf("File %s rename to %s failed\n", ef->filename, new_file_name);
                 }
                 corrupted_files++;
