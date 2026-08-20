@@ -3364,6 +3364,185 @@ typedef struct {
     ProgressContext progress;
 } ExtractingFile;
 
+static int extracting_file_open(ExtractingFile* file, const BlockHeader* header) {
+    char output_file_path[PATH_LEN_FOR_PROC];
+    char* dir_path;
+    char* dir;
+
+    if (file->outfile) {
+        return 0;
+    }
+
+    build_output_path(g_output_path, header->filename, output_file_path, sizeof(output_file_path));
+    dir_path = _strdup(output_file_path);
+    if (!dir_path) {
+        return -1;
+    }
+    dir = dirname(dir_path);
+    if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
+        create_directories(dir);
+    }
+    free(dir_path);
+
+    printf("Extracting: %s", header->filename);
+    if (header->flags & FLAG_ENCRYPTED) printf(" (encrypted)");
+    if (header->flags & FLAG_COMPRESSED) printf(" (compressed)");
+    printf("\n");
+
+    file->outfile = fopen_utf8(output_file_path, "wb");
+    if (!file->outfile) {
+        printf("Error: Cannot create file %s\n", output_file_path);
+        return -1;
+    }
+
+    file->expected_size = header->total_size;
+    file->current_size = 0;
+    file->expected_section_id = 0;
+    file->total_sections = header->total_section_count;
+    file->is_encrypted = (header->flags & FLAG_ENCRYPTED) != 0;
+    file->is_compressed = (header->flags & FLAG_COMPRESSED) != 0;
+    file->corrupted = 0;
+    progress_init(&file->progress, header->total_size, header->total_section_count,
+        header->filename);
+    return 0;
+}
+
+/* Takes ownership of data, which must contain header->section_size bytes. */
+static int extracting_file_process_block(ExtractingFile* file, const BlockHeader* header,
+    uint8_t* data, uint32_t stored_crc) {
+    uint32_t original_len = header->original_size;
+    uint32_t data_len = header->section_size;
+
+    if (header->section_id != file->expected_section_id) {
+        printf("Warning: File '%s' section id mismatch: expected %llu, found %llu\n",
+            file->filename, (unsigned long long)file->expected_section_id,
+            (unsigned long long)header->section_id);
+        file->corrupted = 1;
+    }
+    if (header->data_offset != file->current_size) {
+        printf("Warning: File '%s' data offset mismatch: expected %llu, found %llu\n",
+            file->filename, (unsigned long long)file->current_size,
+            (unsigned long long)header->data_offset);
+        file->corrupted = 1;
+        if (header->data_offset < header->total_size &&
+            _fseeki64(file->outfile, header->data_offset, SEEK_SET) == 0) {
+            file->current_size = header->data_offset;
+        }
+    }
+
+    if (data_len == 0) {
+        free(data);
+        if (stored_crc != 0) {
+            printf("Warning: Empty file %s has non-zero CRC 0x%08x\n", file->filename, stored_crc);
+            file->corrupted = 1;
+        }
+        return 0;
+    }
+
+    uint32_t crc = crc32_calc(data, data_len);
+    if (header->flags & FLAG_ENCRYPTED) {
+        if (!g_encryption_enabled) {
+            printf("Error: The file is encrypted, but no password provided\n");
+            file->corrupted = 1;
+        }
+        else if (data_len % AES_BLOCK_SIZE != 0) {
+            printf("Error: Invalid encrypted section size for %s\n", file->filename);
+            file->corrupted = 1;
+        }
+        else {
+            process_data_block(data, data_len, header->header_crc32, 0);
+            uint32_t unpadded_len;
+            if (pkcs7_unpad(data, data_len, &unpadded_len) < 0) {
+                printf("Error: PKCS#7 unpad failed\n");
+                file->corrupted = 1;
+            }
+            else {
+                data_len = unpadded_len;
+            }
+        }
+    }
+
+    uint8_t* final_data = data;
+    uint32_t final_len = data_len;
+    if (header->flags & FLAG_COMPRESSED) {
+        int has_dict = (header->flags & FLAG_DICT_COMPRESSED) != 0;
+        uint8_t* decompressed = decompress_zstd_with_dict(data, data_len, original_len, has_dict);
+        if (!decompressed) {
+            printf("Error: Decompression failed for %s section id %llu\n", file->filename,
+                (unsigned long long)header->section_id);
+            file->corrupted = 1;
+        }
+        else {
+            free(data);
+            final_data = decompressed;
+            final_len = original_len;
+        }
+    }
+
+    size_t write_len = final_len > original_len ? original_len : final_len;
+    if (fwrite(final_data, 1, write_len, file->outfile) != write_len) {
+        printf("Error: Failed to write data for %s section id %llu\n", file->filename,
+            (unsigned long long)header->section_id);
+        free(final_data);
+        return -1;
+    }
+    if (write_len < original_len &&
+        _fseeki64(file->outfile, original_len - write_len, SEEK_CUR) != 0) {
+        printf("Error: Failed to seek output file %s\n", file->filename);
+        free(final_data);
+        return -1;
+    }
+    free(final_data);
+
+    if (crc != stored_crc) {
+        printf("Error: File %s section id %llu CRC check failed\n", file->filename,
+            (unsigned long long)header->section_id);
+        printf("       Calculated: 0x%08x, Stored: 0x%08x\n", crc, stored_crc);
+        file->corrupted = 1;
+    }
+    file->current_size += original_len;
+    file->expected_section_id = header->section_id + 1;
+    progress_update(&file->progress, file->current_size, header->section_id, 0);
+    return 0;
+}
+
+static int extracting_file_complete(ExtractingFile* file, int* extracted_count,
+    int* corrupted_files) {
+    progress_finish(&file->progress);
+    fclose(file->outfile);
+    file->outfile = NULL;
+
+    if (file->corrupted) {
+        char original_path[PATH_LEN_FOR_PROC];
+        char corrupted_path[PATH_LEN_FOR_PROC];
+        build_output_path(g_output_path, file->filename, original_path, sizeof(original_path));
+        snprintf(corrupted_path, sizeof(corrupted_path), "%s.corrupted", original_path);
+        printf("File %s corrupted, rename to %s\n", file->filename, corrupted_path);
+        if (rename(original_path, corrupted_path) != 0) {
+            printf("File %s rename to %s failed\n", file->filename, corrupted_path);
+        }
+        (*corrupted_files)++;
+        return -1;
+    }
+
+    (*extracted_count)++;
+    char flags_str[32] = "";
+    if (file->is_encrypted && g_encryption_enabled) strcat(flags_str, "decrypted");
+    if (file->is_compressed) {
+        if (strlen(flags_str) > 0) strcat(flags_str, " ");
+        strcat(flags_str, "decompressed");
+    }
+    if (strlen(flags_str) > 0) {
+        printf("Successfully extracted: %s (%llu bytes) (%s)\n", file->filename,
+            (unsigned long long)file->expected_size, flags_str);
+    }
+    else {
+        printf("Successfully extracted: %s (%llu bytes)\n", file->filename,
+            (unsigned long long)file->expected_size);
+    }
+    return 0;
+}
+
 int extract_archive(const char* archive_name, char** files, int file_count) {
     VolumeReadContext vol_ctx;
     int ret = 0;  // 统一返回值
@@ -3578,230 +3757,39 @@ int extract_archive(const char* archive_name, char** files, int file_count) {
             // 需要提取这个文件
             if (file_index >= 0 && extracting_files[file_index].outfile == NULL) {
                 total_file_in_archive++;
-                // 第一次遇到这个文件，打开输出文件
-                char output_file_path[PATH_LEN_FOR_PROC];
-                build_output_path(g_output_path, header.filename, output_file_path, sizeof(output_file_path));
-
-                printf("Extracting: %s", header.filename);
-                if (header.flags & FLAG_ENCRYPTED) printf(" (encrypted)");
-                if (header.flags & FLAG_COMPRESSED) printf(" (compressed)");
-                printf("\n");
-
-                // 创建文件所在的目录
-                char* dir_path = strdup(output_file_path);
-                char* dir = dirname(dir_path);
-                if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
-                    create_directories(dir);
-                }
-                free(dir_path);
-
-                // 打开输出文件
-                extracting_files[file_index].outfile = fopen_utf8(output_file_path, "wb");
-                if (!extracting_files[file_index].outfile) {
-                    printf("Error: Cannot create file %s\n", output_file_path);
+                if (extracting_file_open(&extracting_files[file_index], &header) != 0) {
                     ret = -1;
                     goto cleanup;
                 }
-
-                extracting_files[file_index].expected_size = header.total_size;
-                extracting_files[file_index].current_size = 0;
-                extracting_files[file_index].expected_section_id = 0;
-                extracting_files[file_index].total_sections = header.total_section_count;
-                extracting_files[file_index].is_encrypted = (header.flags & FLAG_ENCRYPTED) ? 1 : 0;
-                extracting_files[file_index].is_compressed = (header.flags & FLAG_COMPRESSED) ? 1 : 0;
-                extracting_files[file_index].corrupted = 0;
-
-                // 初始化进度显示
-                progress_init(&extracting_files[file_index].progress,
-                    header.total_size,
-                    header.total_section_count,
-                    header.filename);
             }
 
             if (file_index >= 0 && extracting_files[file_index].outfile) {
-                // 处理这个块的数据
                 ExtractingFile* ef = &extracting_files[file_index];
-
-                // 检查section_id
-                if (header.section_id != ef->expected_section_id) {
-                    printf("Warning: File '%s' section id mismatch: expected %llu, found %llu\n",
-                        ef->filename, ef->expected_section_id, header.section_id);
-                    ef->corrupted = 1;
-                }
-
-                // 检查data_offset
-                if (header.data_offset != ef->current_size) {
-                    printf("Warning: File '%s' data offset mismatch: expected %llu, found %llu\n",
-                        ef->filename, ef->current_size, header.data_offset);
-                    ef->corrupted = 1;
-                    if (header.data_offset < header.total_size) {
-                        printf("Seeking to expected offset\n");
-                        if (_fseeki64(ef->outfile, header.data_offset, SEEK_SET) != 0) {
-                            printf("Seek failed, error code: %d\n", errno);
-                        }
-                        else {
-                            ef->current_size = header.data_offset;
-                        }
-                    }
-                }
-
-                uint32_t original_len = header.original_size;
-                uint32_t data_len = header.section_size;
-
-                // 处理数据
-                if (data_len > 0) {
-                    // 计算CRC
-                    CRC32_Context ctx;
-                    crc32_init(&ctx);
-
-                    // 读取数据
-                    uint8_t* data_buffer = (uint8_t*)malloc(data_len);
+                uint8_t* data_buffer = NULL;
+                uint32_t stored_crc;
+                if (header.section_size > 0) {
+                    data_buffer = (uint8_t*)malloc(header.section_size);
                     if (!data_buffer) {
-                        printf("Error: Out of memory allocating %u bytes\n", data_len);
+                        printf("Error: Out of memory allocating %u bytes\n", header.section_size);
                         ret = -1;
                         goto cleanup;
                     }
-
-                    size_t actual_read = archive_read(data_buffer, data_len);
-                    if (actual_read != data_len) {
+                    size_t actual_read = archive_read(data_buffer, header.section_size);
+                    if (actual_read != header.section_size) {
                         printf("Error: Failed to read data for %s, expected %u bytes, got %zu\n",
-                            ef->filename, data_len, actual_read);
+                            ef->filename, header.section_size, actual_read);
                         ef->corrupted = 1;
-                        memset(data_buffer + actual_read, 0, data_len - actual_read);
+                        memset(data_buffer + actual_read, 0, header.section_size - actual_read);
                     }
-
-                    // 更新CRC
-                    crc32_update(&ctx, data_buffer, data_len);
-
-                    // 如果需要解密
-                    if (header.flags & FLAG_ENCRYPTED) {
-                        if (g_encryption_enabled) {
-                            if (data_len % AES_BLOCK_SIZE != 0) {
-                                printf("Warning: Section size is not a multiple of AES_BLOCK_SIZE\n");
-                            }
-                            process_data_block(data_buffer, data_len, header.header_crc32, 0);
-                            uint32_t unpadded_len;
-                            if (pkcs7_unpad(data_buffer, data_len, &unpadded_len) < 0) {
-                                printf("Error: PKCS#7 unpad failed\n");
-                                ef->corrupted = 1;
-                            }
-                            else {
-                                data_len = unpadded_len;
-                            }
-                        }
-                        else {
-                            printf("Error: The file is encrypted, but no password provided\n");
-                        }
-                    }
-
-                    // 如果需要解压缩
-                    uint8_t* final_data = data_buffer;
-                    uint32_t final_len = data_len;
-
-                    if (header.flags & FLAG_COMPRESSED) {
-                        int has_dict = (header.flags & FLAG_DICT_COMPRESSED) != 0;
-
-                        uint8_t* decompressed = decompress_zstd_with_dict(
-                            data_buffer, data_len, original_len, has_dict
-                        );
-
-                        if (!decompressed) {
-                            printf("Error: Decompression failed for %s section id %llu\n",
-                                ef->filename, (unsigned long long)header.section_id);
-                            ef->corrupted = 1;
-                        }
-                        else {
-                            free(data_buffer);
-                            final_data = decompressed;
-                            final_len = original_len;
-                        }
-                    }
-
-                    // 写入文件
-                    size_t write_len = final_len > original_len ? original_len : final_len;
-                    size_t actual_write = fwrite(final_data, 1, write_len, ef->outfile);
-
-                    if (actual_write != write_len) {
-                        printf("Error: Failed to write data for %s section id %llu\n",
-                            ef->filename, (unsigned long long)header.section_id);
-                        free(final_data);
-                        ret = -1;
-                        goto cleanup;
-                    }
-
-                    // 如果写入长度小于预期，需要seek
-                    if (write_len < original_len) {
-                        printf("Seeking past the end of file %llu bytes\n", (unsigned long long)(original_len - write_len));
-                        if (_fseeki64(ef->outfile, original_len - write_len, SEEK_CUR) != 0) {
-                            printf("Seek failed, error code: %d\n", errno);
-                        }
-                    }
-
-                    free(final_data);
-
-                    // 读取存储的CRC
-                    uint32_t stored_crc;
-                    read_crc32(&stored_crc,NULL);
-
-                    // 验证CRC
-                    uint32_t crc = crc32_final(&ctx);
-                    if (crc != stored_crc) {
-                        printf("Error: File %s section id %llu CRC check failed\n",
-                            ef->filename, (unsigned long long)header.section_id);
-                        printf("       Calculated: 0x%08x, Stored: 0x%08x\n", crc, stored_crc);
-                        ef->corrupted = 1;
-                    }
-
-                    ef->current_size += original_len;
-                    ef->expected_section_id = header.section_id + 1;
-
-                    // 更新进度
-                    progress_update(&ef->progress, ef->current_size, header.section_id, 0);
                 }
-                else {
-                    // 空文件，跳过CRC
-                    uint32_t stored_crc;
-                    read_crc32(&stored_crc,NULL);
-                    if (stored_crc != 0) {
-                        printf("Warning: Empty file %s has non-zero CRC 0x%08x\n",
-                            ef->filename, stored_crc);
-                    }
-                    ef->current_size = 0;
+                read_crc32(&stored_crc, NULL);
+                if (extracting_file_process_block(ef, &header, data_buffer, stored_crc) != 0) {
+                    ret = -1;
+                    goto cleanup;
                 }
-
-                // 检查文件是否完成
                 if (ef->current_size >= ef->expected_size) {
-                    progress_finish(&ef->progress);
-                    fclose(ef->outfile);
-                    ef->outfile = NULL;
-
-                    if (ef->corrupted) {
-                        corrupted_files++;
-                        char new_file_name[PATH_LEN_FOR_PROC];
-                        char original_path[PATH_LEN_FOR_PROC];
-                        build_output_path(g_output_path, ef->filename, original_path, sizeof(original_path));
-                        snprintf(new_file_name, sizeof(new_file_name), "%s.corrupted", original_path);
-                        printf("File %s corrupted, rename to %s\n", ef->filename, new_file_name);
-                        if (rename(original_path, new_file_name) != 0) {
-                            printf("File %s rename to %s failed\n", ef->filename, new_file_name);
-                        }
-                    }
-                    else {
-                        extracted_count++;
-                        char flags_str[32] = "";
-                        if (ef->is_encrypted && g_encryption_enabled) strcat(flags_str, "decrypted");
-                        if (ef->is_compressed) {
-                            if (strlen(flags_str) > 0) strcat(flags_str, " ");
-                            strcat(flags_str, "decompressed");
-                        }
-                        if (strlen(flags_str) > 0) {
-                            printf("Successfully extracted: %s (%llu bytes) (%s)\n",
-                                ef->filename, ef->expected_size, flags_str);
-                        }
-                        else {
-                            printf("Successfully extracted: %s (%llu bytes)\n",
-                                ef->filename, ef->expected_size);
-                        }
+                    if (extracting_file_complete(ef, &extracted_count, &corrupted_files) != 0) {
+                        ret = -1;
                     }
                 }
             }
@@ -4869,68 +4857,16 @@ int repaired_extract_select_file(RepairedExtractContext* context, const char* fi
 int repaired_extract_open_file(RepairedExtractContext* context, int file_index,
     const BlockHeader* header) {
     ExtractingFile* file = &context->files[file_index];
-    if (file->outfile) {
-        return 0;
-    }
-
-    char output_file_path[PATH_LEN_FOR_PROC];
-    build_output_path(g_output_path, header->filename, output_file_path, sizeof(output_file_path));
-    char* dir_path = strdup(output_file_path);
-    if (!dir_path) {
-        return -1;
-    }
-    char* dir = dirname(dir_path);
-    if (strcmp(dir, ".") != 0 && strcmp(dir, "\\") != 0 && strlen(dir) > 0) {
-        create_directories(dir);
-    }
-    free(dir_path);
-
-    printf("Extracting: %s", header->filename);
-    if (header->flags & FLAG_ENCRYPTED) printf(" (encrypted)");
-    if (header->flags & FLAG_COMPRESSED) printf(" (compressed)");
-    printf("\n");
-
-    file->outfile = fopen_utf8(output_file_path, "wb");
-    if (!file->outfile) {
-        printf("Error: Cannot create file %s\n", output_file_path);
-        return -1;
-    }
-
-    context->total_files++;
-    file->expected_size = header->total_size;
-    file->current_size = 0;
-    file->expected_section_id = 0;
-    file->total_sections = header->total_section_count;
-    file->is_encrypted = (header->flags & FLAG_ENCRYPTED) != 0;
-    file->is_compressed = (header->flags & FLAG_COMPRESSED) != 0;
-    file->corrupted = 0;
-    progress_init(&file->progress, header->total_size, header->total_section_count,
-        header->filename);
+    int was_open = file->outfile != NULL;
+    if (extracting_file_open(file, header) != 0) return -1;
+    if (!was_open) context->total_files++;
     return 0;
 }
 
 int repaired_extract_complete_file(RepairedExtractContext* context, ExtractingFile* file) {
-    progress_finish(&file->progress);
-    fclose(file->outfile);
-    file->outfile = NULL;
-
-    if (file->corrupted) {
-        char original_path[PATH_LEN_FOR_PROC];
-        char corrupted_path[PATH_LEN_FOR_PROC];
-        build_output_path(g_output_path, file->filename, original_path, sizeof(original_path));
-        snprintf(corrupted_path, sizeof(corrupted_path), "%s.corrupted", original_path);
-        printf("File %s corrupted, rename to %s\n", file->filename, corrupted_path);
-        if (rename(original_path, corrupted_path) != 0) {
-            printf("File %s rename to %s failed\n", file->filename, corrupted_path);
-        }
-        context->corrupted_files++;
-        context->ret = -1;
-    }
-    else {
-        context->extracted_count++;
-        printf("Successfully extracted: %s (%llu bytes)\n", file->filename,
-            (unsigned long long)file->expected_size);
-    }
+    int ret = extracting_file_complete(file, &context->extracted_count,
+        &context->corrupted_files);
+    if (ret != 0) context->ret = -1;
     return 0;
 }
 
@@ -4983,95 +4919,8 @@ int repaired_extract_process_block(RepairedExtractContext* context,
     }
 
     ExtractingFile* file = &context->files[file_index];
-    if (header.section_id != file->expected_section_id) {
-        printf("Warning: File '%s' section id mismatch: expected %llu, found %llu\n",
-            file->filename, (unsigned long long)file->expected_section_id,
-            (unsigned long long)header.section_id);
-        file->corrupted = 1;
-    }
-    if (header.data_offset != file->current_size) {
-        printf("Warning: File '%s' data offset mismatch: expected %llu, found %llu\n",
-            file->filename, (unsigned long long)file->current_size,
-            (unsigned long long)header.data_offset);
-        file->corrupted = 1;
-        if (_fseeki64(file->outfile, header.data_offset, SEEK_SET) == 0) {
-            file->current_size = header.data_offset;
-        }
-    }
-
-    uint32_t original_len = header.original_size;
-    uint32_t data_len = header.section_size;
-    if (data_len > 0) {
-        uint32_t crc = crc32_calc(data, data_len);
-        if (header.flags & FLAG_ENCRYPTED) {
-            if (!g_encryption_enabled) {
-                printf("Error: The file is encrypted, but no password provided\n");
-                file->corrupted = 1;
-            }
-            else if (data_len % AES_BLOCK_SIZE != 0) {
-                printf("Error: Invalid encrypted section size for %s\n", file->filename);
-                file->corrupted = 1;
-            }
-            else {
-                process_data_block(data, data_len, header.header_crc32, 0);
-                uint32_t unpadded_len;
-                if (pkcs7_unpad(data, data_len, &unpadded_len) < 0) {
-                    printf("Error: PKCS#7 unpad failed\n");
-                    file->corrupted = 1;
-                }
-                else {
-                    data_len = unpadded_len;
-                }
-            }
-        }
-
-        uint8_t* final_data = data;
-        uint32_t final_len = data_len;
-        if (header.flags & FLAG_COMPRESSED) {
-            int has_dict = (header.flags & FLAG_DICT_COMPRESSED) != 0;
-            uint8_t* decompressed = decompress_zstd_with_dict(data, data_len, original_len, has_dict);
-            if (!decompressed) {
-                printf("Error: Decompression failed for %s section id %llu\n", file->filename,
-                    (unsigned long long)header.section_id);
-                file->corrupted = 1;
-            }
-            else {
-                free(data);
-                final_data = decompressed;
-                final_len = original_len;
-            }
-        }
-
-        size_t write_len = final_len > original_len ? original_len : final_len;
-        if (fwrite(final_data, 1, write_len, file->outfile) != write_len) {
-            printf("Error: Failed to write data for %s section id %llu\n", file->filename,
-                (unsigned long long)header.section_id);
-            free(final_data);
-            return -1;
-        }
-        if (write_len < original_len &&
-            _fseeki64(file->outfile, original_len - write_len, SEEK_CUR) != 0) {
-            printf("Error: Failed to seek output file %s\n", file->filename);
-            free(final_data);
-            return -1;
-        }
-        free(final_data);
-
-        if (crc != stored_crc) {
-            printf("Error: File %s section id %llu CRC check failed\n", file->filename,
-                (unsigned long long)header.section_id);
-            file->corrupted = 1;
-        }
-        file->current_size += original_len;
-        file->expected_section_id = header.section_id + 1;
-        progress_update(&file->progress, file->current_size, header.section_id, 0);
-    }
-    else {
-        free(data);
-        if (stored_crc != 0) {
-            printf("Warning: Empty file %s has non-zero CRC 0x%08x\n", file->filename, stored_crc);
-            file->corrupted = 1;
-        }
+    if (extracting_file_process_block(file, &header, data, stored_crc) != 0) {
+        return -1;
     }
 
     if (file->current_size >= file->expected_size) {
