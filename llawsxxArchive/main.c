@@ -4127,6 +4127,8 @@ typedef struct {
     uint8_t* data_storage;      // contiguous storage for all data shards
     RSDataChunkInfo* chunks;    // 分片信息
     int chunk_count;            // 分片信息数量
+    int available_shards_count;
+    int reconstruction_impossible;
 } RSShardsInfo;
 
 // 释放RSShardsInfo
@@ -4344,12 +4346,6 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         }
     }
 
-    /* The contiguous shard storage now owns the only data-shard copy. */
-    for (int i = 0; i < data_block_count; i++) {
-        free(data_blocks[i].owner->data);
-        data_blocks[i].owner->data = NULL;
-    }
-
     // 从RS块中填充校验分片
     for (int i = 0; i < rs_block_count; i++) {
         RepairBlockInfo* rs_block = &rs_blocks[i];
@@ -4375,6 +4371,23 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
         rs_block->owner->data = NULL;
     }
 
+    int available_shards_count = 0;
+    for (int i = 0; i < nr_shards; i++) {
+        if (!marks[i]) {
+            available_shards_count++;
+        }
+    }
+    int reconstruction_impossible = available_shards_count < data_shards_count;
+
+    /* Keep complete source blocks only when the available shard count proves
+     * reconstruction is impossible. Otherwise the contiguous shard storage
+     * owns the data and the original block buffers can be released. */
+    if (!reconstruction_impossible) {
+        for (int i = 0; i < data_block_count; i++) {
+            free(data_blocks[i].owner->data);
+            data_blocks[i].owner->data = NULL;
+        }
+    }
 
     // 填充输出结构
     rs_info->shards = shards;
@@ -4386,6 +4399,8 @@ int extract_rs_shards_from_group(DataGroupContext* group_ctx, RSShardsInfo* rs_i
      * individually by the shard array. */
     rs_info->chunks = chunks;
     rs_info->chunk_count = chunk_count;
+    rs_info->available_shards_count = available_shards_count;
+    rs_info->reconstruction_impossible = reconstruction_impossible;
 
     // 释放临时数组（不释放分片数据）
     free(data_blocks);
@@ -4493,6 +4508,26 @@ int recovered_archive_write_sink(const uint8_t* data, size_t size, void* context
     return archive_write(data, size, 0, 0) == size ? 0 : -1;
 }
 
+int write_original_group_data(DataGroupContext* group_ctx,
+    RecoveredDataSink sink, void* sink_context) {
+    int ret = 0;
+    DataBlock* current = group_ctx->front;
+    while (current != NULL) {
+        if (current->data && current->size >= sizeof(BlockHeader) + CRC32_SIZE) {
+            BlockHeader header;
+            header_be_to_host((BlockHeader*)current->data, &header);
+            if (!(header.flags & FLAG_RS_REDUNDANT) &&
+                sink(current->data, current->size, sink_context) != 0) {
+                printf("  Warning: Failed to write block id %llu (size=%u)\n",
+                    (unsigned long long)current->block_index, current->size);
+                ret = -1;
+            }
+        }
+        current = current->next;
+    }
+    return ret;
+}
+
 // 恢复group
 int recover_group_with_rs(DataGroupContext* group_ctx,
     RecoveredDataSink sink, void* sink_context) {
@@ -4505,20 +4540,19 @@ int recover_group_with_rs(DataGroupContext* group_ctx,
     RSShardsInfo rs_info;
     int ret = 0;
     if (extract_rs_shards_from_group(group_ctx, &rs_info) != 0) {
-        DataBlock* current = group_ctx->front;
         printf("Error: Failed to prepare RS shards; writing original group data without repair\n");
-        while (current != NULL) {
-            if (current->data && current->size > 0) {
-                BlockHeader header;
-                header_be_to_host((BlockHeader*)current->data, &header);
-                if (!(header.flags & FLAG_RS_REDUNDANT) &&
-                    sink(current->data, current->size, sink_context) != 0) {
-                    printf("  Warning: Failed to write block id %llu (size=%u)\n",
-                        (unsigned long long)current->block_index, current->size);
-                }
-            }
-            current = current->next;
+        write_original_group_data(group_ctx, sink, sink_context);
+        return -1;
+    }
+
+    if (rs_info.reconstruction_impossible) {
+        printf("RS reconstruction impossible: %d available shards, %d required\n",
+            rs_info.available_shards_count, rs_info.data_shards_count);
+        printf("Writing original complete data blocks for best-effort output\n");
+        if (write_original_group_data(group_ctx, sink, sink_context) != 0) {
+            ret = -1;
         }
+        free_rs_shards_info(&rs_info);
         return -1;
     }
 
@@ -4832,6 +4866,9 @@ typedef struct {
     uint8_t raw_crc[CRC32_SIZE];
     size_t crc_used;
     int error;
+    int resyncing;
+    int stream_corrupted;
+    uint64_t skipped_bytes;
 } RepairedArchiveParser;
 
 int repaired_extract_add_file(RepairedExtractContext* context, const char* filename) {
@@ -4962,6 +4999,66 @@ int repaired_parser_process_block(RepairedArchiveParser* parser) {
     return ret;
 }
 
+int repaired_parser_decode_header(RepairedArchiveParser* parser) {
+    BlockHeader raw_header;
+    memcpy(&raw_header, parser->raw_header, sizeof(raw_header));
+
+    uint32_t magic = be32toh(raw_header.magic);
+    if (magic != MAGIC_NUMBER_FILE && magic != MAGIC_NUMBER_DIR) {
+        return 0;
+    }
+
+    uint32_t stored_crc = be32toh(raw_header.header_crc32);
+    uint32_t calculated_crc = crc32_calc(parser->raw_header, sizeof(BlockHeader) - sizeof(uint32_t));
+    if (stored_crc != calculated_crc) {
+        return 0;
+    }
+
+    header_be_to_host(&raw_header, &parser->header);
+    if ((parser->header.magic != MAGIC_NUMBER_FILE &&
+        parser->header.magic != MAGIC_NUMBER_DIR) ||
+        parser->header.section_size > MAX_SECTION_SIZE) {
+        return 0;
+    }
+    return 1;
+}
+
+int repaired_parser_header_magic_at(const uint8_t* data) {
+    uint32_t raw_magic;
+    memcpy(&raw_magic, data, sizeof(raw_magic));
+    uint32_t magic = be32toh(raw_magic);
+    return magic == MAGIC_NUMBER_FILE || magic == MAGIC_NUMBER_DIR;
+}
+
+void repaired_parser_advance_to_header_candidate(RepairedArchiveParser* parser) {
+    uint32_t file_magic = htobe32(MAGIC_NUMBER_FILE);
+    uint32_t dir_magic = htobe32(MAGIC_NUMBER_DIR);
+    const uint8_t* file_magic_bytes = (const uint8_t*)&file_magic;
+    const uint8_t* dir_magic_bytes = (const uint8_t*)&dir_magic;
+    size_t used = parser->header_used;
+
+    for (size_t offset = 1; offset + sizeof(file_magic) <= used; ++offset) {
+        if (repaired_parser_header_magic_at(parser->raw_header + offset)) {
+            memmove(parser->raw_header, parser->raw_header + offset, used - offset);
+            parser->header_used = used - offset;
+            parser->skipped_bytes += offset;
+            return;
+        }
+    }
+
+    size_t keep = used < sizeof(file_magic) - 1 ? used : sizeof(file_magic) - 1;
+    while (keep > 0 &&
+        memcmp(parser->raw_header + used - keep, file_magic_bytes, keep) != 0 &&
+        memcmp(parser->raw_header + used - keep, dir_magic_bytes, keep) != 0) {
+        keep--;
+    }
+    if (keep > 0) {
+        memmove(parser->raw_header, parser->raw_header + used - keep, keep);
+    }
+    parser->header_used = keep;
+    parser->skipped_bytes += used - keep;
+}
+
 int repaired_parser_feed(RepairedArchiveParser* parser, const uint8_t* data, size_t size) {
     while (size > 0) {
         if (parser->state == REPAIRED_PARSE_HEADER) {
@@ -4973,12 +5070,21 @@ int repaired_parser_feed(RepairedArchiveParser* parser, const uint8_t* data, siz
             size -= copy_size;
             if (parser->header_used != sizeof(BlockHeader)) continue;
 
-            header_be_to_host((const BlockHeader*)parser->raw_header, &parser->header);
-            if ((parser->header.magic != MAGIC_NUMBER_FILE && parser->header.magic != MAGIC_NUMBER_DIR) ||
-                parser->header.section_size > MAX_SECTION_SIZE) {
-                printf("Error: Recovered stream contains an invalid block header\n");
-                parser->error = -1;
-                return -1;
+            if (!repaired_parser_decode_header(parser)) {
+                if (!parser->resyncing) {
+                    printf("Warning: Recovered stream lost block alignment; searching for the next valid header\n");
+                    parser->resyncing = 1;
+                    parser->stream_corrupted = 1;
+                    parser->skipped_bytes = 0;
+                }
+                repaired_parser_advance_to_header_candidate(parser);
+                continue;
+            }
+            if (parser->resyncing) {
+                printf("Warning: Recovered stream resynchronized after skipping %llu bytes\n",
+                    (unsigned long long)parser->skipped_bytes);
+                parser->resyncing = 0;
+                parser->skipped_bytes = 0;
             }
             parser->data_used = 0;
             parser->crc_used = 0;
@@ -5197,8 +5303,21 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
         printf("Processing group index %llu\n", (unsigned long long)last_group_id);
         if (recover_group_with_rs(group_ctx, repaired_parser_sink, &parser) != 0) ret = -1;
     }
-    if (parser.error || parser.state != REPAIRED_PARSE_HEADER || parser.header_used != 0) {
+    if (parser.error || parser.state != REPAIRED_PARSE_HEADER) {
         printf("Error: Recovered stream ended with an incomplete block\n");
+        ret = -1;
+    }
+    else if (parser.header_used != 0) {
+        if (parser.resyncing) {
+            printf("Warning: Ignored %llu trailing bytes while searching for a valid block header\n",
+                (unsigned long long)(parser.skipped_bytes + parser.header_used));
+        }
+        else {
+            printf("Error: Recovered stream ended with an incomplete block header\n");
+        }
+        ret = -1;
+    }
+    if (parser.stream_corrupted) {
         ret = -1;
     }
 
