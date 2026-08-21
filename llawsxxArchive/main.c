@@ -2418,6 +2418,7 @@ int validate_block_header(BlockHeader* header, long long found_pos, long long st
     return 0;
 }
 
+        FILE* source = fopen_utf8(source_name, "rb");
 // 扫描并定位下一个magic number
 long long find_next_magic(FILE* file, long long start_pos, long long file_size) {
     unsigned char byte;
