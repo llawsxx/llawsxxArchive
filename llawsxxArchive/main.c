@@ -157,6 +157,18 @@ typedef struct {
     int is_multi_volume;        // 是否多分卷模式
 } VolumeReadContext;
 
+typedef struct {
+    uint64_t block_id;
+    uint64_t volume_number;
+    long long offset;
+} ArchiveBlockIndexEntry;
+
+typedef struct {
+    ArchiveBlockIndexEntry* entries;
+    size_t count;
+    size_t capacity;
+} ArchiveBlockIndex;
+
 // 进度显示上下文结构体
 typedef struct {
     uint64_t current;           // 当前处理的数据量
@@ -259,6 +271,9 @@ size_t archive_read(void* ptr, size_t size);
 int archive_seek(long long offset, int origin);
 long long archive_tell(void);
 int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards_count, uint64_t group_index,uint32_t split_count);
+long long find_next_magic(FILE* file, long long start_pos, long long file_size);
+int extract_archive(const char* archive_name, char** files, int file_count);
+int extract_archive_with_repair(const char* archive_name, char** files, int file_count);
 
 // UTF-16 转 UTF-8，返回 malloc 分配的字符串，调用者负责 free
 char* utf16_to_utf8(const wchar_t* utf16) {
@@ -335,6 +350,20 @@ int rename_utf8(const char* old_path, const char* new_path) {
     int saved_errno = errno;
     free(old_wpath);
     free(new_wpath);
+    errno = saved_errno;
+    return result;
+}
+
+int remove_utf8(const char* path) {
+    wchar_t* wpath = utf8_to_utf16(path);
+    if (!wpath) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int result = _wremove(wpath);
+    int saved_errno = errno;
+    free(wpath);
     errno = saved_errno;
     return result;
 }
@@ -2418,7 +2447,203 @@ int validate_block_header(BlockHeader* header, long long found_pos, long long st
     return 0;
 }
 
-        FILE* source = fopen_utf8(source_name, "rb");
+static int archive_block_index_compare(const void* left, const void* right) {
+    const ArchiveBlockIndexEntry* a = (const ArchiveBlockIndexEntry*)left;
+    const ArchiveBlockIndexEntry* b = (const ArchiveBlockIndexEntry*)right;
+    if (a->block_id < b->block_id) return -1;
+    if (a->block_id > b->block_id) return 1;
+    if (a->volume_number < b->volume_number) return -1;
+    if (a->volume_number > b->volume_number) return 1;
+    return a->offset < b->offset ? -1 : (a->offset > b->offset ? 1 : 0);
+}
+
+static int archive_block_index_add(ArchiveBlockIndex* index,
+    uint64_t block_id, uint64_t volume_number, long long offset) {
+    if (index->count == index->capacity) {
+        size_t new_capacity = index->capacity ? index->capacity * 2 : 1024;
+        ArchiveBlockIndexEntry* entries = (ArchiveBlockIndexEntry*)realloc(
+            index->entries, new_capacity * sizeof(*entries));
+        if (!entries) return -1;
+        index->entries = entries;
+        index->capacity = new_capacity;
+    }
+    index->entries[index->count].block_id = block_id;
+    index->entries[index->count].volume_number = volume_number;
+    index->entries[index->count].offset = offset;
+    index->count++;
+    return 0;
+}
+
+static int archive_index_scan_volume(FILE* file, long long file_size,
+    uint64_t volume_number, ArchiveBlockIndex* index) {
+    long long start_pos = 0;
+    while (1) {
+        long long pos = find_next_magic(file, start_pos, file_size);
+        if (pos < 0) break;
+        if (_fseeki64(file, pos, SEEK_SET) != 0) break;
+
+        BlockHeader raw_header;
+        BlockHeader header;
+        if (fread(&raw_header, 1, sizeof(raw_header), file) != sizeof(raw_header)) {
+            start_pos = pos + 1;
+            continue;
+        }
+        uint32_t stored_header_crc = be32toh(raw_header.header_crc32);
+        if (crc32_calc(&raw_header, sizeof(raw_header) - sizeof(uint32_t)) != stored_header_crc) {
+            start_pos = pos + 1;
+            continue;
+        }
+        header_be_to_host(&raw_header, &header);
+        if (header.magic != MAGIC_NUMBER_FILE && header.magic != MAGIC_NUMBER_DIR) {
+            start_pos = pos + 1;
+            continue;
+        }
+
+        uint8_t data_buffer[64 * 1024];
+        uint64_t remaining = header.section_size;
+        CRC32_Context crc_ctx;
+        crc32_init(&crc_ctx);
+        int data_valid = 1;
+        while (remaining > 0) {
+            size_t read_size = remaining < sizeof(data_buffer) ?
+                (size_t)remaining : sizeof(data_buffer);
+            if (fread(data_buffer, 1, read_size, file) != read_size) {
+                data_valid = 0;
+                break;
+            }
+            crc32_update(&crc_ctx, data_buffer, read_size);
+            remaining -= read_size;
+        }
+        if (!data_valid) {
+            start_pos = pos + (long long)sizeof(BlockHeader);
+            continue;
+        }
+        uint32_t raw_crc = 0;
+        if (fread(&raw_crc, 1, sizeof(raw_crc), file) != sizeof(raw_crc)) {
+            start_pos = pos + (long long)sizeof(BlockHeader);
+            continue;
+        }
+        uint32_t stored_crc = be32toh(raw_crc);
+        uint32_t calculated_crc = crc32_final(&crc_ctx);
+        int crc_valid = header.magic == MAGIC_NUMBER_DIR ? stored_crc == 0 :
+            (header.section_size == 0 ? stored_crc == 0 : calculated_crc == stored_crc);
+        /* Keep blocks with an intact header and complete physical payload even
+         * when their data CRC fails. RS recovery can still use unaffected
+         * chunks inside the block. */
+        if (archive_block_index_add(index, header.block_id, volume_number, pos) != 0) {
+            return -1;
+        }
+        start_pos = crc_valid ? _ftelli64(file) :
+            pos + (long long)sizeof(BlockHeader);
+    }
+    return 0;
+}
+
+static int copy_file_range(FILE* source, FILE* target, long long offset, uint64_t size) {
+    uint8_t buffer[64 * 1024];
+    if (_fseeki64(source, offset, SEEK_SET) != 0) return -1;
+    while (size > 0) {
+        size_t want = size < sizeof(buffer) ? (size_t)size : sizeof(buffer);
+        size_t got = fread(buffer, 1, want, source);
+        if (got != want || fwrite(buffer, 1, got, target) != got) return -1;
+        size -= got;
+    }
+    return 0;
+}
+
+static int create_indexed_archive(const char* archive_name, const char* indexed_name) {
+    VolumeReadContext scan_ctx;
+    ArchiveBlockIndex index = { 0 };
+    if (volume_read_init(&scan_ctx, archive_name) != 0) return -1;
+
+    do {
+        if (archive_index_scan_volume(scan_ctx.file, scan_ctx.file_size,
+            scan_ctx.current_volume, &index) != 0) {
+            volume_read_close(&scan_ctx);
+            free(index.entries);
+            return -1;
+        }
+    } while (volume_read_next(&scan_ctx) == 0);
+    volume_read_close(&scan_ctx);
+
+    qsort(index.entries, index.count, sizeof(*index.entries), archive_block_index_compare);
+    FILE* output = fopen_utf8(indexed_name, "wb");
+    if (!output) {
+        free(index.entries);
+        return -1;
+    }
+
+    char base_name[512];
+    uint64_t first_volume = 1;
+    int multi_volume = parse_volume_filename(archive_name, base_name, sizeof(base_name), &first_volume) == 0;
+    FILE* source = NULL;
+    uint64_t source_volume = UINT64_MAX;
+    int result = -1;
+    for (size_t i = 0; i < index.count; i++) {
+        uint64_t indexed_volume = index.entries[i].volume_number;
+        if (!source || source_volume != indexed_volume) {
+            char source_name[512];
+            if (source) {
+                fclose(source);
+                source = NULL;
+            }
+            if (multi_volume) {
+                get_volume_filename(base_name, indexed_volume,
+                    source_name, sizeof(source_name));
+            }
+            else {
+                strncpy(source_name, archive_name, sizeof(source_name) - 1);
+                source_name[sizeof(source_name) - 1] = '\0';
+            }
+            source = fopen_utf8(source_name, "rb");
+            if (!source) goto cleanup_indexed_archive;
+            source_volume = indexed_volume;
+        }
+        if (_fseeki64(source, index.entries[i].offset, SEEK_SET) != 0) {
+            goto cleanup_indexed_archive;
+        }
+        BlockHeader raw_header;
+        if (fread(&raw_header, 1, sizeof(raw_header), source) != sizeof(raw_header)) {
+            goto cleanup_indexed_archive;
+        }
+        BlockHeader header;
+        header_be_to_host(&raw_header, &header);
+        uint64_t block_size = sizeof(BlockHeader) + (uint64_t)header.section_size + CRC32_SIZE;
+        if (copy_file_range(source, output, index.entries[i].offset, block_size) != 0) {
+            goto cleanup_indexed_archive;
+        }
+    }
+    result = 0;
+
+cleanup_indexed_archive:
+    if (source) fclose(source);
+    fclose(output);
+    free(index.entries);
+    if (result == 0) {
+    printf("Indexed %zu header-valid blocks and sorted them by block_id\n", index.count);
+    }
+    else {
+        remove_utf8(indexed_name);
+    }
+    return result;
+}
+
+static int extract_archive_indexed(const char* archive_name, char** files, int file_count,
+    int repair) {
+    char indexed_name[PATH_LEN_FOR_PROC];
+    snprintf(indexed_name, sizeof(indexed_name), "%s.indexed.tmp", archive_name);
+    if (create_indexed_archive(archive_name, indexed_name) != 0) {
+        printf("Error: Failed to build archive block index\n");
+        return -1;
+    }
+    int result = repair ? extract_archive_with_repair(indexed_name, files, file_count) :
+        extract_archive(indexed_name, files, file_count);
+    if (remove_utf8(indexed_name) != 0) {
+        printf("Warning: Failed to remove indexed temporary archive: %s\n", indexed_name);
+    }
+    return result;
+}
+
 // 扫描并定位下一个magic number
 long long find_next_magic(FILE* file, long long start_pos, long long file_size) {
     unsigned char byte;
@@ -4803,7 +5028,10 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
                             (unsigned long long)header.block_id,
                             (unsigned long long)header.block_group_id,
                             calc_crc, stored_crc);
-                        block_available = 0;
+                        /* Keep the block: RS may still recover chunks whose
+                         * individual CRCs remain valid. Rescan afterward in
+                         * case a deleted range made the declared length skip
+                         * over the next header. */
                         need_resync = 1;
                     }
                 }
@@ -4838,13 +5066,13 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
             }
         }
 
-        if (need_resync) {
+        if (need_resync && !block_available) {
             if (data_buffer) {
                 free(data_buffer);
                 data_buffer = NULL;
             }
-            // 从当前块起点后一字节开始找，允许在损坏块内容中重新发现真实 header。
-            start_pos = block_start_pos + 1;
+            // header 已验证，从 payload 起点重新搜索后续 header。
+            start_pos = block_start_pos + (long long)sizeof(BlockHeader);
             printf("Resyncing after corrupted block %llu (group %llu) from position 0x%llx\n",
                 (unsigned long long)header.block_id,
                 (unsigned long long)header.block_group_id,
@@ -4913,7 +5141,8 @@ int repair_archive(const char* archive_name, const char* repaired_archive_name) 
             data_buffer = NULL;
         }
 
-        start_pos = archive_tell();
+        start_pos = need_resync ?
+            block_start_pos + (long long)sizeof(BlockHeader) : archive_tell();
     }
     if (last_group_id != (uint64_t)-1 && group_ctx->total_size > 0) {
         printf("Processing group index %llu\n", last_group_id);
@@ -5357,7 +5586,8 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
                 need_resync = 1;
             }
             if (crc32_calc(data, header.section_size) != stored_crc) {
-                block_available = 0;
+                /* Keep the header-valid block; chunk CRCs decide which parts
+                 * can still be used by RS. */
                 need_resync = 1;
             }
         }
@@ -5368,10 +5598,10 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
             }
         }
 
-        if (need_resync) {
+        if (need_resync && !block_available) {
             free(data);
             data = NULL;
-            start_pos = block_start_pos + 1;
+            start_pos = block_start_pos + (long long)sizeof(BlockHeader);
             printf("Resyncing after corrupted block %llu (group %llu) from position 0x%llx\n",
                 (unsigned long long)header.block_id,
                 (unsigned long long)header.block_group_id,
@@ -5418,7 +5648,8 @@ int extract_archive_with_repair(const char* archive_name, char** files, int file
             free(data);
             data = NULL;
         }
-        start_pos = archive_tell();
+        start_pos = need_resync ?
+            block_start_pos + (long long)sizeof(BlockHeader) : archive_tell();
     }
 
     if (last_group_id != (uint64_t)-1 && group_ctx->total_size > 0) {
@@ -5726,6 +5957,7 @@ void print_usage(const char* progname) {
     printf("  -d, --dict <file>           Use ZSTD dictionary for compression/decompression\n");
     printf("                              Dictionary can be trained with the train-dict command\n");
     printf("  --repair                     Recover RS groups while extracting; no repaired archive is created\n");
+    printf("  --index                      Scan and sort valid blocks by block_id before extraction\n");
     printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (up to 256 total shards; GF(2^8))\n");
     printf("  --rs-size <size>             Enable fixed-size RS redundancy per group (e.g. 50M; conflicts with --rs)\n");
     printf("  --rs-group-size <size>      Set RS group size (default: 512M, maximum: 16G)\n");
@@ -5986,6 +6218,7 @@ int _main(int argc, char* argv[]) {
         int output_index = -1;
         int dict_index = -1;
         int repair_while_extracting = 0;
+        int index_before_extracting = 0;
 
         // 检查是否有-p和-o和--dict选项
         for (int i = 2; i < argc; i++) {
@@ -6009,6 +6242,9 @@ int _main(int argc, char* argv[]) {
             }
             else if (strcmp(argv[i], "--repair") == 0) {
                 repair_while_extracting = 1;
+            }
+            else if (strcmp(argv[i], "--index") == 0) {
+                index_before_extracting = 1;
             }
             else {
                 archive_index = i;
@@ -6038,7 +6274,12 @@ int _main(int argc, char* argv[]) {
         }
 
         int result;
-        if (repair_while_extracting) {
+        if (index_before_extracting) {
+            result = extract_archive_indexed(argv[archive_index],
+                archive_index + 1 < argc ? &argv[archive_index + 1] : NULL,
+                argc - archive_index - 1, repair_while_extracting);
+        }
+        else if (repair_while_extracting) {
             result = extract_archive_with_repair(argv[archive_index],
                 archive_index + 1 < argc ? &argv[archive_index + 1] : NULL,
                 argc - archive_index - 1);
