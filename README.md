@@ -83,7 +83,7 @@ lxar <command> [options] <arguments>
 
 ```
 lxar archive [-o <output>] [-s <size>] [-v <size>] [-p <password>]
-             [-z <level>] [--rs <data> <parity>]
+             [-z <level>] [--rs <data> <parity> | --rs-size <size>]
              [--rs-group-size <size>] <file_or_directory>
 ```
 
@@ -168,6 +168,7 @@ Reconstructs a new valid archive using Reed-Solomon parity blocks to recover cor
 | `-p`, `--password <password>` | none | Encryption password. Either a plain string (padded/truncated to 16 bytes) or a 32-character hex string (e.g. `00112233445566778899aabbccddeeff`) |
 | `-z`, `--compress <level>` | `3` | ZSTD compression level `1`–`22`. Use `0` to disable compression |
 | `--rs <data> <parity>` | disabled | Enable Reed-Solomon with GF(2^8). Total shards must not exceed 256. |
+| `--rs-size <size>` | disabled | Target a fixed amount of parity data per RS group (for example `50M`). Conflicts with `--rs`; the encoder dynamically selects data/parity shard counts, up to 256 total shards. |
 | `--rs-group-size <size>` | `512M` | Accumulate this much data before emitting an RS group. Range: `1M` – `16G`. A shard must remain within 4G. |
 | `--repair` | disabled | With `extract`, reconstruct damaged RS groups directly into extracted files. Requires RS redundancy. |
 
@@ -245,6 +246,9 @@ lxar archive --rs 10 3 -o protected.lxar myfolder
 # Smaller RS group size for finer-grained recovery
 lxar archive --rs 10 3 --rs-group-size 64M -o protected.lxar myfolder
 
+# Target about 50 MB of parity data per RS group
+lxar archive --rs-size 50M -o protected-fixed-redundancy.lxar myfolder
+
 # Repair a damaged archive
 lxar repair -o repaired.lxar protected.lxar
 
@@ -289,9 +293,9 @@ lxar verify -p mypassword encrypted.lxar
    All volumes are automatically discovered by incrementing the volume number.  
    **RS 修复时需指定第一个分卷**，程序会自动递增编号读取后续分卷。
 
-3. **`--rs` must be specified at archive creation time.**  
-   Repair is not possible without parity blocks.  
-   **`--rs` 必须在创建归档时指定**，没有校验块则无法修复。
+3. **`--rs` or `--rs-size` must be specified at archive creation time.**
+   Repair is not possible without parity blocks.
+   **`--rs` 或 `--rs-size` 必须在创建归档时指定**，没有校验块则无法修复。
 
 4. **Section size affects recovery granularity and archive overhead.**  
    Smaller sections = finer recovery + more header overhead.  

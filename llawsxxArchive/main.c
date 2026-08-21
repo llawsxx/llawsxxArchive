@@ -247,6 +247,8 @@ uint64_t g_current_block_group_index = 0;   // 当前块组索引计数器
 int g_rs_enabled = 0;                // 是否启用RS冗余
 int g_rs_data_shards = 0;            // RS数据分片数
 int g_rs_parity_shards = 0;          // RS校验分片数
+int g_rs_fixed_size_enabled = 0;     // 是否按固定字节数生成RS冗余
+uint64_t g_rs_fixed_size = 0;         // 目标RS冗余字节数
 uint64_t g_rs_group_size = 512 * 1024 * 1024;
 // 全局字典上下文
 DictContext* g_dict_ctx = NULL;
@@ -3886,13 +3888,85 @@ cleanup:
 int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards_count, uint64_t group_index, uint32_t split_count) {
     if (!group_ctx || group_ctx->front == NULL) return -1;
 
-    ReassembledContext* split_info = reassemble_data_by_count(group_ctx, split_count);
+    uint32_t effective_split_count = split_count;
+    int effective_parity_shards_count = parity_shards_count;
+
+    if (g_rs_fixed_size_enabled) {
+        uint64_t total_size = group_ctx->total_size;
+        int best_data_shards = 0;
+        int best_parity_shards = 0;
+        int best_total_shards = 0;
+
+        /* Search for the largest valid total shard count. For each candidate
+         * data-shard count, the parity count is the minimum needed to reach
+         * the requested redundancy size. */
+        for (int data_count = 1; data_count < 256; data_count++) {
+            uint64_t shard_size = (total_size + (uint64_t)data_count - 1) /
+                (uint64_t)data_count;
+            if (shard_size == 0 || shard_size > UINT32_MAX) {
+                continue;
+            }
+
+            uint64_t parity_needed = g_rs_fixed_size / shard_size;
+            if (g_rs_fixed_size % shard_size != 0) {
+                parity_needed++;
+            }
+            if (parity_needed == 0) {
+                parity_needed = 1;
+            }
+            if (parity_needed > (uint64_t)(256 - data_count)) {
+                continue;
+            }
+
+            int total_shards = data_count + (int)parity_needed;
+            if (total_shards > best_total_shards ||
+                (total_shards == best_total_shards &&
+                    (int)parity_needed > best_parity_shards)) {
+                best_data_shards = data_count;
+                best_parity_shards = (int)parity_needed;
+                best_total_shards = total_shards;
+            }
+        }
+
+        if (best_data_shards == 0) {
+            /* The requested redundancy is larger than this tiny group can
+             * represent with at most 256 shards. Use one data shard and as
+             * many parity shards as possible. */
+            uint64_t shard_size = total_size;
+            uint64_t parity_needed = (shard_size > 0) ?
+                (g_rs_fixed_size / shard_size + (g_rs_fixed_size % shard_size != 0)) : 1;
+            if (parity_needed > 255) {
+                parity_needed = 255;
+            }
+            if (parity_needed == 0) {
+                parity_needed = 1;
+            }
+            best_data_shards = 1;
+            best_parity_shards = (int)parity_needed;
+            best_total_shards = best_data_shards + best_parity_shards;
+            printf("Warning: RS redundancy target %llu bytes cannot be reached for "
+                "group size %llu with 256 shards; using %d data and %d parity shards\n",
+                (unsigned long long)g_rs_fixed_size,
+                (unsigned long long)total_size,
+                best_data_shards, best_parity_shards);
+        }
+
+        effective_split_count = (uint32_t)best_data_shards;
+        effective_parity_shards_count = best_parity_shards;
+        printf("RS group %llu: %d data shards, %d parity shards, %d total shards "
+            "(target redundancy %llu bytes)\n",
+            (unsigned long long)group_index,
+            best_data_shards, best_parity_shards, best_total_shards,
+            (unsigned long long)g_rs_fixed_size);
+    }
+
+    ReassembledContext* split_info = reassemble_data_by_count(group_ctx, effective_split_count);
     if (!split_info) return -1;
 
     uint32_t max_block_size = (uint32_t)split_info->split_size;
     ReassembledBlock* current = split_info->block_info;
     int data_shards_count = split_info->block_count;
-    int total_shards_count = data_shards_count + parity_shards_count;
+    int total_shards_count = data_shards_count + effective_parity_shards_count;
 
     // 初始化指针
     fec_t* code = NULL;
@@ -3904,7 +3978,7 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
 
     // 为RS编码准备数据
     data_shards = (uint8_t**)calloc(data_shards_count, sizeof(uint8_t*));
-    parity_shards = (uint8_t**)calloc(parity_shards_count, sizeof(uint8_t*));
+    parity_shards = (uint8_t**)calloc(effective_parity_shards_count, sizeof(uint8_t*));
 
     if (!data_shards || !parity_shards) {
         goto cleanup;
@@ -3919,14 +3993,14 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
     }
 
     // 初始化校验分片
-    for (int i = 0; i < parity_shards_count; i++) {
+    for (int i = 0; i < effective_parity_shards_count; i++) {
         parity_shards[i] = (uint8_t*)calloc(max_block_size, 1);
         if (!parity_shards[i]) {
             goto cleanup;
         }
     }
 
-    if (data_shards_count <= 0 || parity_shards_count <= 0 ||
+    if (data_shards_count <= 0 || effective_parity_shards_count <= 0 ||
         total_shards_count > 256) {
         printf("Error: RS total shard count must be between 1 and 256\n");
         goto cleanup;
@@ -3938,25 +4012,25 @@ int rs_group_reassemble_and_write(DataGroupContext* group_ctx, int parity_shards
         goto cleanup;
     }
 
-    blocknums = malloc(sizeof(uint32_t) * parity_shards_count);
+    blocknums = malloc(sizeof(uint32_t) * effective_parity_shards_count);
 
     if (!blocknums) {
         ret = -1;
         goto cleanup;
     }
 
-    for (int i = 0; i < parity_shards_count; i++) {
+    for (int i = 0; i < effective_parity_shards_count; i++) {
         blocknums[i] = (uint32_t)(i + data_shards_count);
     }
 
     // 执行编码
     fec_encode(code, (const gf* const*)data_shards, (gf* const*)parity_shards,
-        (const unsigned int*)blocknums, parity_shards_count, max_block_size);
+        (const unsigned int*)blocknums, effective_parity_shards_count, max_block_size);
 
     // 计算并写入RS冗余块
-    uint64_t total_section_count = parity_shards_count;
+    uint64_t total_section_count = effective_parity_shards_count;
 
-    for (int i = 0; i < parity_shards_count; i++) {
+    for (int i = 0; i < effective_parity_shards_count; i++) {
         // 准备RS块头
         BlockHeader header = { 0 };
         header.magic = MAGIC_NUMBER_FILE;
@@ -4061,7 +4135,7 @@ cleanup:
     }
 
     if (parity_shards) {
-        for (int i = 0; i < parity_shards_count; i++) {
+        for (int i = 0; i < effective_parity_shards_count; i++) {
             if (parity_shards[i]) {
                 free(parity_shards[i]);
             }
@@ -5629,7 +5703,7 @@ int train_dictionary(const char** file_list, int file_count,
 void print_usage(const char* progname) {
     printf("LLawsXX Archive Tool (lxar) - Windows Version (with AES encryption, ZSTD compression, multi-volume and RS redundancy support)\n");
     printf("Usage:\n");
-    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity>] [--rs-group-size <size>] <file_or_directory>   - Create archive\n", progname);
+    printf("  %s archive [-o <output_file>] [-s <size>] [-v <size>] [-p <password>] [-z <level>] [-d <dict>] [--rs <data> <parity> | --rs-size <size>] [--rs-group-size <size>] <file_or_directory>   - Create archive\n", progname);
     printf("  %s extract [--repair] [-o <output_dir>] [-p <password>] [-d <dict>] <archive>       - Extract all files\n", progname);
     printf("  %s extract [--repair] [-o <output_dir>] [-p <password>] [-d <dict>] <archive> <files> - Extract specific files\n", progname);
     printf("  %s list <archive>                     - List archive contents\n", progname);
@@ -5652,6 +5726,7 @@ void print_usage(const char* progname) {
     printf("                              Dictionary can be trained with the train-dict command\n");
     printf("  --repair                     Recover RS groups while extracting; no repaired archive is created\n");
     printf("  --rs <data> <parity>        Enable Reed-Solomon redundancy (up to 256 total shards; GF(2^8))\n");
+    printf("  --rs-size <size>             Enable fixed-size RS redundancy per group (e.g. 50M; conflicts with --rs)\n");
     printf("  --rs-group-size <size>      Set RS group size (default: 512M, maximum: 16G)\n");
     printf("\nDictionary Training:\n");
     printf("  train-dict -o <dict_file> [-s <max_size>] <files...>\n");
@@ -5691,6 +5766,7 @@ void print_usage(const char* progname) {
     printf("\n  # Reed-Solomon redundancy\n");
     printf("  %s archive --rs 10 3 myfolder                 # Add 3 parity blocks for every 10 data blocks\n", progname);
     printf("  %s archive --rs 10 3 --rs-group-size 200M myfolder\n", progname);
+    printf("  %s archive --rs-size 50M myfolder             # Target about 50MB redundancy per RS group\n", progname);
     printf("\n  # Encryption\n");
     printf("  %s archive -p mypassword myfolder\n", progname);
     printf("  %s archive -p 00112233445566778899aabbccddeeff -o key.lxar myfolder\n", progname);
@@ -5731,6 +5807,7 @@ int _main(int argc, char* argv[]) {
         int rs_data = -1;
         int rs_parity = -1;
         int rs_group_size_index = -1;
+        int rs_size_index = -1;
 
         // 检查是否有各种选项
         for (int i = 2; i < argc; i++) {
@@ -5775,6 +5852,12 @@ int _main(int argc, char* argv[]) {
                     rs_data = atoi(argv[i + 1]);
                     rs_parity = atoi(argv[i + 2]);
                     i += 2;
+                }
+            }
+            else if (strcmp(argv[i], "--rs-size") == 0) {
+                if (i + 1 < argc) {
+                    rs_size_index = i + 1;
+                    i++;
                 }
             }
             else if (strcmp(argv[i], "--rs-group-size") == 0) {
@@ -5828,6 +5911,11 @@ int _main(int argc, char* argv[]) {
         }
 
         // 冗余设置
+        if (rs_size_index != -1 && (rs_data != -1 || rs_parity != -1)) {
+            printf("Error: --rs-size conflicts with --rs\n");
+            return 1;
+        }
+
         if (rs_data > 0 && rs_parity > 0) {
             uint64_t total_rs_shards = (uint64_t)(unsigned int)rs_data + (uint64_t)(unsigned int)rs_parity;
             if (total_rs_shards <= 256) {
@@ -5842,6 +5930,19 @@ int _main(int argc, char* argv[]) {
                 printf("RS redundancy not enabled: %d data shards + %d parity shards larger than 256\n",
                     rs_data, rs_parity);
             }
+        }
+        else if (rs_size_index != -1) {
+            g_rs_fixed_size = parse_size(argv[rs_size_index]);
+            if (g_rs_fixed_size == 0) {
+                printf("Error: --rs-size must be greater than zero\n");
+                return 1;
+            }
+            g_rs_enabled = 1;
+            g_rs_fixed_size_enabled = 1;
+            g_current_block_group_index = 1;
+            printf("RS redundancy enabled: target %llu bytes per group, "
+                "dynamic shard counts (up to 256 total, GF(2^8))\n",
+                (unsigned long long)g_rs_fixed_size);
         }
 
         if (rs_group_size_index != -1) {
